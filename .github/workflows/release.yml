@@ -113,6 +113,7 @@ jobs:
             rm -rf "$package_dir" "$binary"
           done
           cp install.sh dist/install.sh
+          sed -i 's/\r$//' dist/install.sh
           cd dist
           sha256sum bpb-ip-linux-*.zip install.sh > SHA256SUMS
 

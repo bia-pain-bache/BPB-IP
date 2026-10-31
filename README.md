@@ -9,7 +9,7 @@ The installer detects the CPU architecture, installs dependencies if missing, do
 Running the installer again gets the scanner updated while preserving configs.
 
 ```sh
-sudo curl -fsSL https://github.com/bia-pain-bache/BPB-IP/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/bia-pain-bache/BPB-IP/releases/latest/download/install.sh | sudo bash
 ```
 
 On first install, it interactively asks for the Cloudflare zone ID, dedicated DNS hostname, and API token.
