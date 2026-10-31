@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
@@ -88,17 +89,22 @@ func (e retryableCloudflareError) Unwrap() error {
 }
 
 func (c CloudflareClient) ReconcileDNS(ctx context.Context, recordName string, endpoints []Endpoint) error {
+	_, err := c.ReconcileDNSWithDeleted(ctx, recordName, endpoints)
+	return err
+}
+
+func (c CloudflareClient) ReconcileDNSWithDeleted(ctx context.Context, recordName string, endpoints []Endpoint) ([]Endpoint, error) {
 	if strings.TrimSpace(c.ZoneID) == "" {
-		return fmt.Errorf("Cloudflare zoneId is required")
+		return nil, fmt.Errorf("Cloudflare zoneId is required")
 	}
 	if strings.TrimSpace(recordName) == "" {
-		return fmt.Errorf("Cloudflare recordName is required")
+		return nil, fmt.Errorf("Cloudflare recordName is required")
 	}
 	if strings.TrimSpace(c.Token) == "" {
-		return fmt.Errorf("Cloudflare API token is empty")
+		return nil, fmt.Errorf("Cloudflare API token is empty")
 	}
 	if len(endpoints) == 0 {
-		return fmt.Errorf("refusing to update DNS with an empty endpoint set")
+		return nil, fmt.Errorf("refusing to update DNS with an empty endpoint set")
 	}
 
 	desired := make(map[string]map[string]struct{})
@@ -117,13 +123,13 @@ func (c CloudflareClient) ReconcileDNS(ctx context.Context, recordName string, e
 		desired[recordType][ip.String()] = struct{}{}
 	}
 	if len(desired) == 0 {
-		return fmt.Errorf("refusing to update DNS: no valid port 443 IP addresses")
+		return nil, fmt.Errorf("refusing to update DNS: no valid port 443 IP addresses")
 	}
 
 	for attempt := 1; attempt <= cloudflareMaxAttempts; attempt++ {
 		records, err := c.listRecords(ctx, recordName)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		batch := dnsBatchPayload{}
@@ -144,7 +150,7 @@ func (c CloudflareClient) ReconcileDNS(ctx context.Context, recordName string, e
 			batch.Deletes = append(batch.Deletes, dnsRecordDelete{ID: record.ID})
 		}
 		if len(batch.Deletes)+len(batch.Posts) == 0 {
-			return nil
+			return nil, nil
 		}
 
 		sort.Slice(batch.Deletes, func(i, j int) bool {
@@ -161,16 +167,76 @@ func (c CloudflareClient) ReconcileDNS(ctx context.Context, recordName string, e
 		path := "/zones/" + url.PathEscape(c.ZoneID) + "/dns_records/batch"
 		err = c.request(ctx, http.MethodPost, path, batch, &response)
 		if err == nil {
-			return nil
+			return deletedDNSAddresses(records, desired), nil
 		}
 		if !isRetryableCloudflareError(err) || attempt == cloudflareMaxAttempts {
-			return fmt.Errorf("apply Cloudflare DNS batch for %s: %w", recordName, err)
+			return nil, fmt.Errorf("apply Cloudflare DNS batch for %s: %w", recordName, err)
 		}
 		if err := waitCloudflareRetry(ctx, err, attempt); err != nil {
-			return fmt.Errorf("retry Cloudflare DNS batch for %s: %w", recordName, err)
+			return nil, fmt.Errorf("retry Cloudflare DNS batch for %s: %w", recordName, err)
 		}
 	}
-	return fmt.Errorf("apply Cloudflare DNS batch for %s: retry attempts exhausted", recordName)
+	return nil, fmt.Errorf("apply Cloudflare DNS batch for %s: retry attempts exhausted", recordName)
+}
+
+func deletedDNSAddresses(records []dnsRecord, desired map[string]map[string]struct{}) []Endpoint {
+	deleted := make([]Endpoint, 0)
+	seen := make(map[netip.Addr]struct{})
+	for _, record := range records {
+		ip, err := netip.ParseAddr(record.Content)
+		if err != nil {
+			continue
+		}
+		ip = ip.Unmap()
+		if _, retained := desired[record.Type][ip.String()]; retained {
+			continue
+		}
+		if _, exists := seen[ip]; exists {
+			continue
+		}
+		seen[ip] = struct{}{}
+		deleted = append(deleted, Endpoint{IP: ip, Port: 443})
+	}
+	return deleted
+}
+
+func (c CloudflareClient) CountRecordsExcludingHostname(ctx context.Context, hostname string) (int, error) {
+	if strings.TrimSpace(c.ZoneID) == "" {
+		return 0, fmt.Errorf("Cloudflare zoneId is required")
+	}
+	if strings.TrimSpace(hostname) == "" {
+		return 0, fmt.Errorf("Cloudflare recordName is required")
+	}
+	if strings.TrimSpace(c.Token) == "" {
+		return 0, fmt.Errorf("Cloudflare API token is empty")
+	}
+
+	const pageSize = 1000
+	recordCount := 0
+	for page := 1; ; page++ {
+		query := url.Values{
+			"per_page": []string{strconv.Itoa(pageSize)},
+			"page":     []string{strconv.Itoa(page)},
+		}
+		var response cloudflareEnvelope[[]dnsRecord]
+		path := "/zones/" + url.PathEscape(c.ZoneID) + "/dns_records?" + query.Encode()
+		if err := c.requestWithRetry(ctx, http.MethodGet, path, nil, &response); err != nil {
+			return 0, fmt.Errorf("count Cloudflare DNS records: %w", err)
+		}
+		for _, record := range response.Result {
+			if !equalDNSName(record.Name, hostname) {
+				recordCount++
+			}
+		}
+		if response.ResultInfo.TotalPages > 0 {
+			if page >= response.ResultInfo.TotalPages {
+				break
+			}
+		} else if len(response.Result) < pageSize {
+			break
+		}
+	}
+	return recordCount, nil
 }
 
 func (c CloudflareClient) listRecords(ctx context.Context, recordName string) ([]dnsRecord, error) {

@@ -7,9 +7,23 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
+)
+
+type endpointProbeResult struct {
+	Endpoint Endpoint
+	Status   string
+	Speed    float64
+	Error    string
+}
+
+const (
+	probeStatusPassed  = "passed"
+	probeStatusFailed  = "failed"
+	probeStatusDeleted = "deleted"
 )
 
 func ProbeEndpoint(ctx context.Context, endpoint Endpoint, config Config) error {
@@ -69,8 +83,15 @@ func CheckEndpoints(
 	config Config,
 	probe func(context.Context, Endpoint, Config) error,
 	logger Logger,
-) []Endpoint {
-	results := make([]bool, len(endpoints))
+) []endpointProbeResult {
+	results := make([]endpointProbeResult, len(endpoints))
+	for index, endpoint := range endpoints {
+		results[index] = endpointProbeResult{
+			Endpoint: endpoint,
+			Status:   probeStatusFailed,
+			Error:    "probe was not completed",
+		}
+	}
 	var next int
 	var mu sync.Mutex
 	workerCount := min(config.ConcurrentRuns, len(endpoints))
@@ -93,27 +114,52 @@ func CheckEndpoints(
 				mu.Unlock()
 
 				endpoint := endpoints[index]
-				passed := true
+				var lastError error
+				var totalDuration time.Duration
 				for trial := 1; trial <= config.Trials; trial++ {
+					started := time.Now()
 					err := probe(ctx, endpoint, config)
+					duration := time.Since(started)
 					if err != nil {
 						logger.Printf("%s trial %d/%d: failed: %v", endpoint, trial, config.Trials, err)
-						passed = false
+						lastError = err
 						break
 					}
-					logger.Printf("%s trial %d/%d: passed", endpoint, trial, config.Trials)
+					totalDuration += duration
+					speed := float64(config.ExpectedBytes) / duration.Seconds() / (1024 * 1024)
+					logger.Printf("%s trial %d/%d: passed (%.2f MiB/s)", endpoint, trial, config.Trials, speed)
 				}
-				results[index] = passed
+				if lastError != nil {
+					results[index].Error = lastError.Error()
+					continue
+				}
+				results[index].Status = probeStatusPassed
+				results[index].Error = ""
+				if totalDuration > 0 {
+					results[index].Speed = float64(config.ExpectedBytes*int64(config.Trials)) /
+						totalDuration.Seconds() / (1024 * 1024)
+				}
 			}
 		}()
 	}
 	workers.Wait()
 
-	var working []Endpoint
-	for index, passed := range results {
-		if passed {
-			working = append(working, endpoints[index])
+	return orderProbeResults(results)
+}
+
+func orderProbeResults(results []endpointProbeResult) []endpointProbeResult {
+	ranked := make([]endpointProbeResult, 0, len(results))
+	failed := make([]endpointProbeResult, 0, len(results))
+	for _, result := range results {
+		if result.Status == probeStatusPassed {
+			ranked = append(ranked, result)
+		} else {
+			failed = append(failed, result)
 		}
 	}
-	return working
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return ranked[i].Speed > ranked[j].Speed
+	})
+	ordered := append(ranked, failed...)
+	return ordered
 }

@@ -15,7 +15,7 @@ import (
 func main() {
 	configPath := flag.String("config", "config.json", "path to the JSON configuration file")
 	listPath := flag.String("list", "list.txt", "path to the local endpoint list")
-	outputPath := flag.String("output", "results/ips.json", "path for the scan results")
+	resultsDir := flag.String("results-dir", "results", "directory for timestamped scan reports")
 	dryRun := flag.Bool("dry-run", false, "scan endpoints without changing Cloudflare DNS")
 	configureCloudflare := flag.Bool("configure-cloudflare", false, "read zone ID, hostname, and API token from stdin and save them in config")
 	flag.Parse()
@@ -48,7 +48,7 @@ func main() {
 		Context:    ctx,
 		ConfigPath: *configPath,
 		ListPath:   *listPath,
-		OutputPath: *outputPath,
+		ResultsDir: *resultsDir,
 		DryRun:     *dryRun,
 		Logger:     logger,
 	}

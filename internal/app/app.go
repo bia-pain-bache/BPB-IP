@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,11 +21,13 @@ type Logger interface {
 	Printf(format string, values ...any)
 }
 
+const maxCloudflareRecords = 200
+
 type Options struct {
 	Context    context.Context
 	ConfigPath string
 	ListPath   string
-	OutputPath string
+	ResultsDir string
 	DryRun     bool
 	Logger     Logger
 }
@@ -35,8 +39,8 @@ func Run(options Options) error {
 	if options.ListPath == "" {
 		options.ListPath = "list.txt"
 	}
-	if options.OutputPath == "" {
-		options.OutputPath = filepath.Join("results", "ips.json")
+	if options.ResultsDir == "" {
+		options.ResultsDir = "results"
 	}
 	if options.Logger == nil {
 		options.Logger = log.New(os.Stdout, "", log.LstdFlags)
@@ -59,26 +63,46 @@ func Run(options Options) error {
 	}
 	endpoints := CollectEndpoints(options.Context, string(localContents), config, options.Logger, nil)
 	if len(endpoints) == 0 {
-		options.Logger.Printf("no port 443 endpoints found across list.txt, sourceUrls, and sourceDomains; skipping scan")
+		path, err := writeScanResults(options.ResultsDir, nil, nil, time.Now())
+		if err != nil {
+			return err
+		}
+		options.Logger.Printf("no port 443 endpoints found across list.txt, sourceUrls, and sourceDomains; wrote empty scan report to %s", path)
 		return nil
 	}
 
-	working := CheckEndpoints(options.Context, endpoints, config, ProbeEndpoint, options.Logger)
-	if err := writeResults(options.OutputPath, working); err != nil {
-		return err
+	results := CheckEndpoints(options.Context, endpoints, config, ProbeEndpoint, options.Logger)
+	working := make([]Endpoint, 0, len(results))
+	for _, result := range results {
+		if result.Status == probeStatusPassed {
+			working = append(working, result.Endpoint)
+		}
 	}
-	options.Logger.Printf("wrote %d working endpoints to %s", len(working), options.OutputPath)
 	if len(working) == 0 {
+		path, err := writeScanResults(options.ResultsDir, results, nil, time.Now())
+		if err != nil {
+			return err
+		}
+		options.Logger.Printf("wrote scan report to %s", path)
 		return fmt.Errorf("no healthy endpoints; preserving existing Cloudflare DNS records")
 	}
 
 	recordName := strings.TrimSpace(config.Cloudflare.RecordName)
 	if options.DryRun {
-		options.Logger.Printf("dry run: would update DNS-only A/AAAA records for %s with %d endpoints", recordName, len(working))
+		uploadEndpoints := limitCloudflareEndpoints(working, maxCloudflareRecords)
+		options.Logger.Printf("dry run: would update DNS-only A/AAAA records for %s with up to %d fastest endpoints", recordName, len(uploadEndpoints))
+		path, err := writeScanResults(options.ResultsDir, results, nil, time.Now())
+		if err != nil {
+			return err
+		}
+		options.Logger.Printf("wrote scan report to %s", path)
 		return nil
 	}
 	token := strings.TrimSpace(config.Cloudflare.APIToken)
 	if token == "" {
+		if _, err := writeScanResults(options.ResultsDir, results, nil, time.Now()); err != nil {
+			return err
+		}
 		return fmt.Errorf(`Cloudflare API token is empty in config "cloudflare.apiToken"`)
 	}
 	client := CloudflareClient{
@@ -86,11 +110,60 @@ func Run(options Options) error {
 		Token:  token,
 		Client: &http.Client{Timeout: 30 * time.Second},
 	}
-	if err := client.ReconcileDNS(options.Context, recordName, working); err != nil {
+	otherRecordCount, err := client.CountRecordsExcludingHostname(options.Context, recordName)
+	if err != nil {
+		if _, writeErr := writeScanResults(options.ResultsDir, results, nil, time.Now()); writeErr != nil {
+			return fmt.Errorf("%w (also failed to write scan report: %v)", err, writeErr)
+		}
 		return err
 	}
-	options.Logger.Printf("updated DNS-only A/AAAA records for %s", recordName)
+	availableSlots := availableCloudflareRecordSlots(otherRecordCount)
+	uploadEndpoints := limitCloudflareEndpoints(working, availableSlots)
+	options.Logger.Printf(
+		"Cloudflare zone has %d records outside %s; using %d of %d available record slots for the fastest IPs",
+		otherRecordCount,
+		recordName,
+		len(uploadEndpoints),
+		availableSlots,
+	)
+	if len(uploadEndpoints) == 0 {
+		if _, err := writeScanResults(options.ResultsDir, results, nil, time.Now()); err != nil {
+			return err
+		}
+		return fmt.Errorf("Cloudflare DNS record limit reached: no record slots available outside %s; existing records were preserved", recordName)
+	}
+	deleted, reconcileErr := client.ReconcileDNSWithDeleted(options.Context, recordName, uploadEndpoints)
+	path, writeErr := writeScanResults(options.ResultsDir, results, deleted, time.Now())
+	if writeErr != nil {
+		if reconcileErr != nil {
+			return fmt.Errorf("%w (also failed to write scan report: %v)", reconcileErr, writeErr)
+		}
+		return writeErr
+	}
+	if reconcileErr != nil {
+		return reconcileErr
+	}
+	options.Logger.Printf("updated DNS-only A/AAAA records for %s with %d fastest endpoints", recordName, len(uploadEndpoints))
+	options.Logger.Printf("wrote scan report to %s", path)
 	return nil
+}
+
+func availableCloudflareRecordSlots(otherRecordCount int) int {
+	available := maxCloudflareRecords - otherRecordCount
+	if available < 0 {
+		return 0
+	}
+	return available
+}
+
+func limitCloudflareEndpoints(endpoints []Endpoint, limit int) []Endpoint {
+	if limit <= 0 {
+		return nil
+	}
+	if limit < len(endpoints) {
+		return endpoints[:limit]
+	}
+	return endpoints
 }
 
 func ValidateSources(config Config, listPath string) error {
@@ -176,25 +249,65 @@ func ConfigureCloudflare(path string, input io.Reader) error {
 	return nil
 }
 
-func writeResults(path string, endpoints []Endpoint) error {
-	results := make([]string, 0, len(endpoints))
-	for _, endpoint := range endpoints {
-		if endpoint.Port == 443 {
-			results = append(results, endpoint.String())
+func writeScanResults(resultsDir string, results []endpointProbeResult, deleted []Endpoint, scannedAt time.Time) (string, error) {
+	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
+		return "", fmt.Errorf("create results directory %s: %w", resultsDir, err)
+	}
+	timestamp := scannedAt.Format("06-01-02--15:04:05")
+	if os.PathSeparator == '\\' {
+		timestamp = strings.ReplaceAll(timestamp, ":", "-")
+	}
+	var path string
+	var file *os.File
+	var err error
+	for suffix := 0; ; suffix++ {
+		name := "results-" + timestamp
+		if suffix > 0 {
+			name += "-" + strconv.Itoa(suffix)
+		}
+		path = filepath.Join(resultsDir, name+".csv")
+		file, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			break
+		}
+		if !os.IsExist(err) {
+			return "", fmt.Errorf("create scan report %s: %w", path, err)
 		}
 	}
-	data, err := json.MarshalIndent(results, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode results: %w", err)
+
+	writer := csv.NewWriter(file)
+	if err := writer.Write([]string{"IP", "Status", "Speed", "Error"}); err != nil {
+		_ = file.Close()
+		return "", fmt.Errorf("write scan report header: %w", err)
 	}
-	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create results directory: %w", err)
+	for _, result := range results {
+		speed := ""
+		if result.Status == probeStatusPassed {
+			speed = fmt.Sprintf("%.2f MiB/s", result.Speed)
+		}
+		if err := writer.Write([]string{result.Endpoint.IP.String(), result.Status, speed, result.Error}); err != nil {
+			_ = file.Close()
+			return "", fmt.Errorf("write scan report row: %w", err)
+		}
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return fmt.Errorf("write results file %s: %w", path, err)
+	for _, endpoint := range deleted {
+		if !endpoint.IP.IsValid() {
+			continue
+		}
+		if err := writer.Write([]string{endpoint.IP.Unmap().String(), probeStatusDeleted, "", ""}); err != nil {
+			_ = file.Close()
+			return "", fmt.Errorf("write deleted endpoint to scan report: %w", err)
+		}
 	}
-	return nil
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		_ = file.Close()
+		return "", fmt.Errorf("flush scan report: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("close scan report: %w", err)
+	}
+	return path, nil
 }
 
 type domainResolver func(context.Context, string) ([]net.IPAddr, error)

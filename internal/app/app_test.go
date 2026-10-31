@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -276,7 +277,7 @@ func TestCollectEndpointsAggregatesBestEffortSourcesAndFilters443(t *testing.T) 
 	}
 }
 
-func TestCheckEndpointsStopsRetriesAndPreservesInputOrder(t *testing.T) {
+func TestCheckEndpointsStopsRetriesAndReturnsHealthyEndpoints(t *testing.T) {
 	config := testConfig()
 	endpoints := []Endpoint{
 		{IP: netip.MustParseAddr("192.0.2.1"), Port: 443},
@@ -286,7 +287,7 @@ func TestCheckEndpointsStopsRetriesAndPreservesInputOrder(t *testing.T) {
 	var mu sync.Mutex
 	attempts := make(map[Endpoint]int)
 	logger := &testLogger{}
-	working := CheckEndpoints(
+	results := CheckEndpoints(
 		context.Background(),
 		endpoints,
 		config,
@@ -301,14 +302,140 @@ func TestCheckEndpointsStopsRetriesAndPreservesInputOrder(t *testing.T) {
 		},
 		logger,
 	)
-	if !reflect.DeepEqual(working, []Endpoint{endpoints[0], endpoints[2]}) {
-		t.Fatalf("working endpoints = %#v", working)
+	if len(results) != 3 ||
+		results[0].Status != probeStatusPassed ||
+		results[1].Status != probeStatusPassed ||
+		results[2].Status != probeStatusFailed ||
+		results[2].Error != "probe failed" {
+		t.Fatalf("probe results = %#v, want two passed followed by one failed result", results)
 	}
 	if attempts[endpoints[1]] != 1 {
 		t.Fatalf("failing endpoint was tried %d times, want one", attempts[endpoints[1]])
 	}
 	if attempts[endpoints[0]] != config.Trials {
 		t.Fatalf("healthy endpoint trials = %d, want %d", attempts[endpoints[0]], config.Trials)
+	}
+}
+
+func TestOrderProbeResultsBySpeedAndStatus(t *testing.T) {
+	endpoints := []Endpoint{
+		{IP: netip.MustParseAddr("192.0.2.1"), Port: 443},
+		{IP: netip.MustParseAddr("192.0.2.2"), Port: 443},
+		{IP: netip.MustParseAddr("192.0.2.3"), Port: 443},
+	}
+	results := []endpointProbeResult{
+		{Endpoint: endpoints[0], Status: probeStatusPassed, Speed: 5},
+		{Endpoint: endpoints[1], Status: probeStatusPassed, Speed: 10},
+		{Endpoint: endpoints[2], Status: probeStatusFailed, Error: "probe failed"},
+	}
+	got := orderProbeResults(results)
+	want := []endpointProbeResult{results[1], results[0], results[2]}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("orderProbeResults() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLimitCloudflareEndpointsKeepsFastest200(t *testing.T) {
+	endpoints := make([]Endpoint, maxCloudflareRecords+1)
+	for index := range endpoints {
+		endpoints[index] = Endpoint{
+			IP:   netip.AddrFrom4([4]byte{192, 0, byte(index / 256), byte(index%256 + 1)}),
+			Port: 443,
+		}
+	}
+	selected := limitCloudflareEndpoints(endpoints, maxCloudflareRecords)
+	if len(selected) != maxCloudflareRecords {
+		t.Fatalf("selected %d endpoints, want %d", len(selected), maxCloudflareRecords)
+	}
+	if selected[maxCloudflareRecords-1] != endpoints[maxCloudflareRecords-1] {
+		t.Fatal("selected endpoints do not preserve the fastest-first order")
+	}
+}
+
+func TestAvailableCloudflareRecordSlots(t *testing.T) {
+	tests := []struct {
+		otherRecords int
+		want         int
+	}{
+		{otherRecords: 2, want: 198},
+		{otherRecords: 199, want: 1},
+		{otherRecords: 200, want: 0},
+		{otherRecords: 205, want: 0},
+	}
+	for _, test := range tests {
+		if got := availableCloudflareRecordSlots(test.otherRecords); got != test.want {
+			t.Errorf("availableCloudflareRecordSlots(%d) = %d, want %d", test.otherRecords, got, test.want)
+		}
+	}
+}
+
+func TestLimitCloudflareEndpointsUsesAvailableSlots(t *testing.T) {
+	endpoints := make([]Endpoint, 200)
+	for index := range endpoints {
+		endpoints[index] = Endpoint{
+			IP:   netip.AddrFrom4([4]byte{192, 0, byte(index / 256), byte(index%256 + 1)}),
+			Port: 443,
+		}
+	}
+	selected := limitCloudflareEndpoints(endpoints, availableCloudflareRecordSlots(2))
+	if len(selected) != 198 {
+		t.Fatalf("selected %d endpoints, want 198", len(selected))
+	}
+	if selected[197] != endpoints[197] {
+		t.Fatal("selected endpoints do not preserve fastest-first order")
+	}
+}
+
+func containsEndpoint(endpoints []Endpoint, target Endpoint) bool {
+	for _, endpoint := range endpoints {
+		if endpoint == target {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCountRecordsExcludingHostname(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/zones/zone-id/dns_records" {
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
+		if r.URL.Query().Get("name") != "" {
+			t.Errorf("record count request unexpectedly filtered by name: %s", r.URL.RawQuery)
+		}
+		page := r.URL.Query().Get("page")
+		w.Header().Set("Content-Type", "application/json")
+		switch page {
+		case "1":
+			_, _ = io.WriteString(w, `{"success":true,"result_info":{"total_pages":2},"result":[
+				{"id":"a","type":"A","name":"text.example.com","content":"192.0.2.1"},
+				{"id":"b","type":"MX","name":"example.com","content":"mail.example.com"},
+				{"id":"c","type":"TXT","name":"x.example.com","content":"v=spf1"}
+			]}`)
+		case "2":
+			_, _ = io.WriteString(w, `{"success":true,"result_info":{"total_pages":2},"result":[
+				{"id":"d","type":"AAAA","name":"TEXT.EXAMPLE.COM.","content":"2001:db8::1"},
+				{"id":"e","type":"CNAME","name":"www.example.com","content":"example.com"}
+			]}`)
+		default:
+			http.Error(w, "unexpected page", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	client := CloudflareClient{
+		ZoneID:  "zone-id",
+		Token:   "test-token",
+		BaseURL: server.URL,
+		Client:  server.Client(),
+	}
+	count, err := client.CountRecordsExcludingHostname(context.Background(), "text.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("CountRecordsExcludingHostname() = %d, want 3", count)
 	}
 }
 
@@ -404,8 +531,17 @@ func TestReconcileDNSBatchesChangesAndPreservesOtherRecordTypes(t *testing.T) {
 		BaseURL: server.URL,
 		Client:  server.Client(),
 	}
-	if err := client.ReconcileDNS(context.Background(), "proxy.example.com", endpoints); err != nil {
+	deleted, err := client.ReconcileDNSWithDeleted(context.Background(), "proxy.example.com", endpoints)
+	if err != nil {
 		t.Fatal(err)
+	}
+	wantDeleted := []Endpoint{
+		{IP: netip.MustParseAddr("192.0.2.2"), Port: 443},
+		{IP: netip.MustParseAddr("2001:db8::2"), Port: 443},
+		{IP: netip.MustParseAddr("192.0.2.4"), Port: 443},
+	}
+	if !reflect.DeepEqual(deleted, wantDeleted) {
+		t.Fatalf("deleted DNS endpoints = %#v, want %#v", deleted, wantDeleted)
 	}
 
 	mu.Lock()
@@ -495,7 +631,7 @@ func TestRunRejectsAllEmptyInputsAndPreservesPreviousResults(t *testing.T) {
 	directory := t.TempDir()
 	configPath := filepath.Join(directory, "config.json")
 	listPath := filepath.Join(directory, "list.txt")
-	outputPath := filepath.Join(directory, "results", "ips.json")
+	resultsDir := filepath.Join(directory, "results")
 	config := `{
 		"probeUrl":"https://probe.example.test/__down",
 		"expectedBytes":4,
@@ -513,10 +649,11 @@ func TestRunRejectsAllEmptyInputsAndPreservesPreviousResults(t *testing.T) {
 	if err := os.WriteFile(listPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0o700); err != nil {
+	if err := os.MkdirAll(resultsDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(outputPath, []byte("last-known-results"), 0o600); err != nil {
+	oldReport := filepath.Join(resultsDir, "previous.csv")
+	if err := os.WriteFile(oldReport, []byte("last-known-results"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -524,13 +661,13 @@ func TestRunRejectsAllEmptyInputsAndPreservesPreviousResults(t *testing.T) {
 	err := Run(Options{
 		ConfigPath: configPath,
 		ListPath:   listPath,
-		OutputPath: outputPath,
+		ResultsDir: resultsDir,
 		Logger:     logger,
 	})
 	if err == nil || !strings.Contains(err.Error(), "no sources configured") {
 		t.Fatalf("Run() error = %v, want no-sources error", err)
 	}
-	got, err := os.ReadFile(outputPath)
+	got, err := os.ReadFile(oldReport)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,22 +676,48 @@ func TestRunRejectsAllEmptyInputsAndPreservesPreviousResults(t *testing.T) {
 	}
 }
 
-func TestWriteResults(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "results", "ips.json")
-	endpoints := []Endpoint{
-		{IP: netip.MustParseAddr("192.0.2.1"), Port: 443},
-		{IP: netip.MustParseAddr("2001:db8::1"), Port: 443},
-		{IP: netip.MustParseAddr("192.0.2.2"), Port: 8443},
+func TestWriteScanResults(t *testing.T) {
+	resultsDir := t.TempDir()
+	results := []endpointProbeResult{
+		{
+			Endpoint: Endpoint{IP: netip.MustParseAddr("192.0.2.1"), Port: 443},
+			Status:   probeStatusPassed,
+			Speed:    12.34,
+		},
+		{
+			Endpoint: Endpoint{IP: netip.MustParseAddr("2001:db8::1"), Port: 443},
+			Status:   probeStatusFailed,
+			Error:    "probe timed out",
+		},
 	}
-	if err := writeResults(path, endpoints); err != nil {
-		t.Fatal(err)
+	deleted := []Endpoint{
+		{IP: netip.MustParseAddr("192.0.2.2"), Port: 443},
 	}
-	got, err := os.ReadFile(path)
+	scannedAt := time.Date(2026, 11, 1, 0, 13, 56, 0, time.UTC)
+	path, err := writeScanResults(resultsDir, results, deleted, scannedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "[\n  \"192.0.2.1:443\",\n  \"[2001:db8::1]:443\"\n]\n"
-	if string(got) != want {
-		t.Fatalf("result file = %q, want %q", got, want)
+	filename := filepath.Base(path)
+	if !strings.HasPrefix(filename, "results-26-11-01--00") || !strings.HasSuffix(filename, ".csv") {
+		t.Fatalf("report filename = %q, want timestamped results CSV", filename)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	got, err := csv.NewReader(file).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"IP", "Status", "Speed", "Error"},
+		{"192.0.2.1", "passed", "12.34 MiB/s", ""},
+		{"2001:db8::1", "failed", "", "probe timed out"},
+		{"192.0.2.2", "deleted", "", ""},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("scan report rows = %#v, want %#v", got, want)
 	}
 }
