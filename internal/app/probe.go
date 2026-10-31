@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -121,16 +122,16 @@ func CheckEndpoints(
 					err := probe(ctx, endpoint, config)
 					duration := time.Since(started)
 					if err != nil {
-						logger.Printf("%s trial %d/%d: failed: %v", endpoint, trial, config.Trials, err)
+						reason := probeErrorReason(err)
+						logger.Printf("[%d/%d] failed - %s: %s", trial, config.Trials, endpoint.IP, reason)
 						lastError = err
 						break
 					}
 					totalDuration += duration
-					speed := float64(config.ExpectedBytes) / duration.Seconds() / (1024 * 1024)
-					logger.Printf("%s trial %d/%d: passed (%.2f MiB/s)", endpoint, trial, config.Trials, speed)
+					logger.Printf("[%d/%d] passed - %s", trial, config.Trials, endpoint.IP)
 				}
 				if lastError != nil {
-					results[index].Error = lastError.Error()
+					results[index].Error = probeErrorReason(lastError)
 					continue
 				}
 				results[index].Status = probeStatusPassed
@@ -145,6 +146,14 @@ func CheckEndpoints(
 	workers.Wait()
 
 	return orderProbeResults(results)
+}
+
+func probeErrorReason(err error) string {
+	var requestError *url.Error
+	if errors.As(err, &requestError) {
+		err = requestError.Err
+	}
+	return err.Error()
 }
 
 func orderProbeResults(results []endpointProbeResult) []endpointProbeResult {

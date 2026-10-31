@@ -285,14 +285,14 @@ func writeScanResults(resultsDir string, results []endpointProbeResult, deleted 
 	}
 
 	writer := csv.NewWriter(file)
-	if err := writer.Write([]string{"IP", "Status", "Speed", "Error"}); err != nil {
+	if err := writer.Write([]string{"IP", "Status", "Speed (KB/s)", "Error"}); err != nil {
 		_ = file.Close()
 		return "", fmt.Errorf("write scan report header: %w", err)
 	}
 	for _, result := range results {
 		speed := ""
 		if result.Status == probeStatusPassed {
-			speed = fmt.Sprintf("%.2f MiB/s", result.Speed)
+			speed = fmt.Sprintf("%.2f", result.Speed*1024*1024/1000)
 		}
 		if err := writer.Write([]string{result.Endpoint.IP.String(), result.Status, speed, result.Error}); err != nil {
 			_ = file.Close()

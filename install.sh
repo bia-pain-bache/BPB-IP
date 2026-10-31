@@ -7,6 +7,7 @@ cat <<'BANNER'
 | __ -|   __| __ -|
 |_____|__|  |_____| BPB IP
 BANNER
+printf '\n'
 
 readonly REPOSITORY="bia-pain-bache/BPB-IP"
 readonly INSTALL_DIR="/opt/bpb-ip"

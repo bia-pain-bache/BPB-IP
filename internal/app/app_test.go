@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -314,6 +315,53 @@ func TestCheckEndpointsStopsRetriesAndReturnsHealthyEndpoints(t *testing.T) {
 	}
 	if attempts[endpoints[0]] != config.Trials {
 		t.Fatalf("healthy endpoint trials = %d, want %d", attempts[endpoints[0]], config.Trials)
+	}
+}
+
+func TestCheckEndpointsUsesConciseLogsAndProbeErrors(t *testing.T) {
+	config := testConfig()
+	config.Trials = 2
+	passed := Endpoint{IP: netip.MustParseAddr("192.0.2.1"), Port: 443}
+	failed := Endpoint{IP: netip.MustParseAddr("192.0.2.2"), Port: 443}
+	logger := &testLogger{}
+	const reason = "context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+	results := CheckEndpoints(
+		context.Background(),
+		[]Endpoint{passed, failed},
+		config,
+		func(_ context.Context, endpoint Endpoint, _ Config) error {
+			if endpoint == failed {
+				return &url.Error{
+					Op:  "Get",
+					URL: "https://speed.cloudflare.com/__down?bytes=10000",
+					Err: errors.New(reason),
+				}
+			}
+			time.Sleep(time.Millisecond)
+			return nil
+		},
+		logger,
+	)
+
+	if !logger.contains("[1/2] passed - 192.0.2.1") ||
+		!logger.contains("[2/2] passed - 192.0.2.1") {
+		t.Errorf("passed trials were not logged in the concise format: %#v", logger.logs)
+	}
+	if !logger.contains("[1/2] failed - 192.0.2.2: " + reason) {
+		t.Errorf("failure log did not contain only the final reason: %#v", logger.logs)
+	}
+	for _, line := range logger.logs {
+		if strings.Contains(line, "https://") || strings.Contains(line, ":443") {
+			t.Errorf("log contains redundant URL or port: %q", line)
+		}
+	}
+	for _, result := range results {
+		if result.Endpoint == failed && result.Error != reason {
+			t.Errorf("CSV error = %q, want %q", result.Error, reason)
+		}
+		if result.Endpoint == passed && result.Speed <= 0 {
+			t.Errorf("passed endpoint aggregate speed = %f, want positive", result.Speed)
+		}
 	}
 }
 
@@ -944,8 +992,8 @@ func TestWriteScanResults(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := [][]string{
-		{"IP", "Status", "Speed", "Error"},
-		{"192.0.2.1", "passed", "12.34 MiB/s", ""},
+		{"IP", "Status", "Speed (KB/s)", "Error"},
+		{"192.0.2.1", "passed", "12939.43", ""},
 		{"2001:db8::1", "failed", "", "probe timed out"},
 		{"192.0.2.2", "deleted", "", ""},
 	}
