@@ -699,8 +699,8 @@ func TestWriteScanResults(t *testing.T) {
 		t.Fatal(err)
 	}
 	filename := filepath.Base(path)
-	if !strings.HasPrefix(filename, "results-26-11-01--00") || !strings.HasSuffix(filename, ".csv") {
-		t.Fatalf("report filename = %q, want timestamped results CSV", filename)
+	if filename != "results-2026-11-01--00-13-56.csv" {
+		t.Fatalf("report filename = %q, want results-2026-11-01--00-13-56.csv", filename)
 	}
 	file, err := os.Open(path)
 	if err != nil {

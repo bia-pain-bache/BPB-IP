@@ -253,10 +253,7 @@ func writeScanResults(resultsDir string, results []endpointProbeResult, deleted 
 	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
 		return "", fmt.Errorf("create results directory %s: %w", resultsDir, err)
 	}
-	timestamp := scannedAt.Format("06-01-02--15:04:05")
-	if os.PathSeparator == '\\' {
-		timestamp = strings.ReplaceAll(timestamp, ":", "-")
-	}
+	timestamp := scannedAt.Format("2006-01-02--15-04-05")
 	var path string
 	var file *os.File
 	var err error
