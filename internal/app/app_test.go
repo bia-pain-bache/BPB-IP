@@ -89,8 +89,11 @@ func TestLoadRepositoryConfig(t *testing.T) {
 	if config.Cloudflare.APIToken != "" {
 		t.Fatal("repository config should not contain a real API token")
 	}
-	if len(config.SourceURLs) == 0 {
-		t.Fatal("expected repository config to contain a URL source")
+	if len(config.SourceURLs) != 0 {
+		t.Fatal("repository config should not contain default URL sources")
+	}
+	if len(config.SourceDomains) != 0 {
+		t.Fatal("repository config should not contain default domain sources")
 	}
 	if interval, err := config.ScanIntervalDuration(); err != nil || interval != 30*time.Minute {
 		t.Fatalf("scan interval = %s, error = %v; want 30m", interval, err)
@@ -125,6 +128,41 @@ func TestScanIntervalValidation(t *testing.T) {
 		if err := config.Validate(); err == nil {
 			t.Errorf("Validate() accepted scanInterval %q", interval)
 		}
+	}
+}
+
+func TestValidateSourcesRequiresAtLeastOneConfiguredSource(t *testing.T) {
+	config := testConfig()
+	config.SourceURLs = []string{" ", ""}
+	config.SourceDomains = []string{" "}
+	if err := ValidateSources(config, filepath.Join(t.TempDir(), "list.txt")); err == nil ||
+		!strings.Contains(err.Error(), "no sources configured") {
+		t.Fatalf("ValidateSources() error = %v, want no-sources error", err)
+	}
+}
+
+func TestValidateSourcesAcceptsConfiguredURLOrDomain(t *testing.T) {
+	for name, configure := range map[string]func(*Config){
+		"url":    func(config *Config) { config.SourceURLs = []string{"https://source.example.test/ips.txt"} },
+		"domain": func(config *Config) { config.SourceDomains = []string{"proxy.example.test"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := testConfig()
+			configure(&config)
+			if err := ValidateSources(config, filepath.Join(t.TempDir(), "list.txt")); err != nil {
+				t.Fatalf("ValidateSources() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateSourcesAcceptsListWithPort443Endpoint(t *testing.T) {
+	listPath := filepath.Join(t.TempDir(), "list.txt")
+	if err := os.WriteFile(listPath, []byte("# proxy endpoints\n192.0.2.1:443\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateSources(testConfig(), listPath); err != nil {
+		t.Fatalf("ValidateSources() error = %v", err)
 	}
 }
 
@@ -453,7 +491,7 @@ func TestReconcileDNSRefusesEmptyHealthySetWithoutAPIRequests(t *testing.T) {
 	}
 }
 
-func TestRunSkipsAllEmptyInputsAndPreservesPreviousResults(t *testing.T) {
+func TestRunRejectsAllEmptyInputsAndPreservesPreviousResults(t *testing.T) {
 	directory := t.TempDir()
 	configPath := filepath.Join(directory, "config.json")
 	listPath := filepath.Join(directory, "list.txt")
@@ -489,8 +527,8 @@ func TestRunSkipsAllEmptyInputsAndPreservesPreviousResults(t *testing.T) {
 		OutputPath: outputPath,
 		Logger:     logger,
 	})
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "no sources configured") {
+		t.Fatalf("Run() error = %v, want no-sources error", err)
 	}
 	got, err := os.ReadFile(outputPath)
 	if err != nil {
@@ -498,9 +536,6 @@ func TestRunSkipsAllEmptyInputsAndPreservesPreviousResults(t *testing.T) {
 	}
 	if string(got) != "last-known-results" {
 		t.Fatalf("empty run changed existing results to %q", got)
-	}
-	if !logger.contains("skipping scan") {
-		t.Fatal("expected the empty run to be logged as skipped")
 	}
 }
 

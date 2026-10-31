@@ -33,6 +33,10 @@ func main() {
 		logger.Printf("error: %v", err)
 		os.Exit(1)
 	}
+	if err := app.ValidateSources(config, *listPath); err != nil {
+		logger.Printf("error: %v", err)
+		os.Exit(1)
+	}
 	interval, err := config.ScanIntervalDuration()
 	if err != nil {
 		logger.Printf("error: %v", err)

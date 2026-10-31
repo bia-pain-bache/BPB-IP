@@ -6,9 +6,7 @@
   "fetchTimeoutMs": 15000,
   "concurrentRuns": 10,
   "trials": 3,
-  "sourceUrls": [
-    "https://raw.githubusercontent.com/NiREvil/vless/main/sub/country_proxies/DE.txt"
-  ],
+  "sourceUrls": [],
   "sourceDomains": [],
   "cloudflare": {
     "zoneId": "",

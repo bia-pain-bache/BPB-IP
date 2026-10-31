@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+cat <<'BANNER'
+ _____ _____ _____
+| __  |  _  | __  |
+| __ -|   __| __ -|
+|_____|__|  |_____| BPB IP
+BANNER
+
 readonly REPOSITORY="bia-pain-bache/BPB-IP"
 readonly INSTALL_DIR="/opt/bpb-ip"
-readonly SERVICE_USER="bpb-ip"
-readonly SERVICE_GROUP="bpb-ip"
 readonly SYSTEMD_DIR="/etc/systemd/system"
 readonly SERVICE_FILE="${SYSTEMD_DIR}/bpb-ip.service"
 readonly RELEASE_URL="https://github.com/${REPOSITORY}/releases/latest/download"
@@ -12,16 +17,6 @@ readonly RELEASE_URL="https://github.com/${REPOSITORY}/releases/latest/download"
 fail() {
   printf 'Error: %s\n' "$*" >&2
   exit 1
-}
-
-prompt_value() {
-  local prompt="$1"
-  local variable="$2"
-  local value=""
-  [[ -r /dev/tty ]] || fail "An interactive terminal is required to configure Cloudflare."
-  read -r -p "$prompt: " value < /dev/tty
-  [[ -n "$value" ]] || fail "$prompt cannot be empty."
-  printf -v "$variable" '%s' "$value"
 }
 
 install_download_dependencies() {
@@ -112,82 +107,44 @@ for package_file in bpb-ip bpb-ip.service config.json; do
     fail "Release archive is missing ${package_file}."
 done
 
-if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
-  if command -v groupadd >/dev/null 2>&1; then
-    groupadd --system "$SERVICE_GROUP"
-  elif command -v addgroup >/dev/null 2>&1; then
-    addgroup --system "$SERVICE_GROUP"
+if systemctl cat bpb-ip.service >/dev/null 2>&1; then
+  [[ -d "$INSTALL_DIR" && -f "${INSTALL_DIR}/config.json" ]] ||
+    fail "The bpb-ip service exists, but its installation or config is missing from ${INSTALL_DIR}."
+  install -o root -g root -m 0755 "${temporary_dir}/package/bpb-ip" "${INSTALL_DIR}/bpb-ip"
+  install -o root -g root -m 0644 "${temporary_dir}/package/bpb-ip.service" "$SERVICE_FILE"
+  systemctl daemon-reload
+  if systemctl is-active --quiet bpb-ip.service; then
+    systemctl restart bpb-ip.service
+    printf 'Updated bpb-ip (%s) and restarted the service. Existing configuration was preserved.\n' "$asset_arch"
   else
-    fail "Neither groupadd nor addgroup is available."
+    printf 'Updated bpb-ip (%s). Existing configuration was preserved; the service remains stopped.\n' "$asset_arch"
+    printf 'Configure sources and start the service with: systemctl start bpb-ip.service\n'
   fi
-fi
-
-if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-  if command -v useradd >/dev/null 2>&1; then
-    no_login="$(command -v nologin || printf '/bin/false')"
-    useradd --system --gid "$SERVICE_GROUP" --home-dir "$INSTALL_DIR" --shell "$no_login" "$SERVICE_USER"
-  elif command -v adduser >/dev/null 2>&1; then
-    adduser --system --no-create-home --home "$INSTALL_DIR" --shell /bin/false \
-      --ingroup "$SERVICE_GROUP" "$SERVICE_USER"
-  else
-    fail "Neither useradd nor adduser is available."
-  fi
+  printf 'Logs: journalctl -u bpb-ip.service\n'
+  exit 0
 fi
 
 install -d -m 0755 "$INSTALL_DIR"
 install -d "$SYSTEMD_DIR"
-install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "${INSTALL_DIR}/results"
+install -d -m 0755 "${INSTALL_DIR}/results"
 touch /var/log/bpb-ip.log
-chown "$SERVICE_USER":"$SERVICE_GROUP" /var/log/bpb-ip.log
 chmod 0640 /var/log/bpb-ip.log
 install -o root -g root -m 0755 "${temporary_dir}/package/bpb-ip" "${INSTALL_DIR}/bpb-ip"
 if [[ ! -f "${INSTALL_DIR}/config.json" ]]; then
-  install -o root -g "$SERVICE_GROUP" -m 0640 "${temporary_dir}/package/config.json" "${INSTALL_DIR}/config.json"
+  install -o root -g root -m 0600 "${temporary_dir}/package/config.json" "${INSTALL_DIR}/config.json"
 fi
 if [[ ! -f "${INSTALL_DIR}/list.txt" ]]; then
   install -o root -g root -m 0644 /dev/null "${INSTALL_DIR}/list.txt"
 fi
 
-if ! grep -Eq '"zoneId"[[:space:]]*:[[:space:]]*"[^"]+"' "${INSTALL_DIR}/config.json" ||
-   ! grep -Eq '"recordName"[[:space:]]*:[[:space:]]*"[^"]+"' "${INSTALL_DIR}/config.json" ||
-   ! grep -Eq '"apiToken"[[:space:]]*:[[:space:]]*"[^"]+"' "${INSTALL_DIR}/config.json"; then
-  prompt_value "Cloudflare zone ID" CLOUDFLARE_ZONE_ID
-  prompt_value "Dedicated DNS hostname (for example proxy.example.com)" CLOUDFLARE_RECORD_NAME
-  [[ "$CLOUDFLARE_RECORD_NAME" =~ ^([A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*$ ]] ||
-    fail "Enter a valid fully-qualified DNS hostname."
-  [[ -r /dev/tty ]] || fail "An interactive terminal is required to enter the API token."
-  read -r -s -p "Cloudflare API token: " CLOUDFLARE_API_TOKEN < /dev/tty
-  printf '\n' > /dev/tty
-  [[ -n "$CLOUDFLARE_API_TOKEN" ]] || fail "Cloudflare API token cannot be empty."
-  [[ "$CLOUDFLARE_API_TOKEN" != *$'\n'* && "$CLOUDFLARE_API_TOKEN" != *$'\r'* ]] ||
-    fail "The API token must be a single line."
-  printf '\nThis will manage only DNS-only A/AAAA records for %s in zone %s.\n' \
-    "$CLOUDFLARE_RECORD_NAME" "$CLOUDFLARE_ZONE_ID"
-  read -r -p "Continue? [y/N] " answer < /dev/tty
-  [[ "$answer" == "y" || "$answer" == "Y" ]] || fail "Installation cancelled."
-  printf '%s\n%s\n%s\n' "$CLOUDFLARE_ZONE_ID" "$CLOUDFLARE_RECORD_NAME" "$CLOUDFLARE_API_TOKEN" |
-    "${INSTALL_DIR}/bpb-ip" --config "${INSTALL_DIR}/config.json" --configure-cloudflare
-fi
-
-chown root:"$SERVICE_GROUP" "${INSTALL_DIR}/config.json"
-chmod 0640 "${INSTALL_DIR}/config.json"
+chown root:root "${INSTALL_DIR}/config.json"
+chmod 0600 "${INSTALL_DIR}/config.json"
 install -o root -g root -m 0644 "${temporary_dir}/package/bpb-ip.service" "$SERVICE_FILE"
-rm -f /etc/logrotate.d/bpb-ip
-
-if [[ -f "${SYSTEMD_DIR}/bpb-ip.timer" ]]; then
-  if systemctl is-active --quiet bpb-ip.timer; then
-    systemctl stop bpb-ip.timer
-  fi
-  if systemctl is-enabled --quiet bpb-ip.timer 2>/dev/null; then
-    systemctl disable bpb-ip.timer
-  fi
-  rm -f "${SYSTEMD_DIR}/bpb-ip.timer"
-fi
-rm -f /etc/bpb-ip/bpb-ip.env
 
 systemctl daemon-reload
-systemctl enable bpb-ip.service
-systemctl restart bpb-ip.service
-printf 'Installed bpb-ip (%s). The service scans immediately and follows scanInterval in config.json.\n' "$asset_arch"
-printf 'Edit %s to change URL/domain sources. Logs: journalctl -u bpb-ip.service\n' "${INSTALL_DIR}/config.json"
-printf 'Log file: /var/log/bpb-ip.log (kept without automatic rotation).\n'
+printf 'Installed bpb-ip (%s). The service is not enabled or started until you configure it.\n' "$asset_arch"
+printf 'Edit %s and populate sourceUrls, sourceDomains, and Cloudflare settings, or add endpoints to %s.\n' \
+  "${INSTALL_DIR}/config.json" "${INSTALL_DIR}/list.txt"
+printf 'Enable and start the service with: systemctl enable --now bpb-ip.service\n'
+printf 'Logs: journalctl -u bpb-ip.service\n'
+printf 'Log file: /var/log/bpb-ip.log.\n'

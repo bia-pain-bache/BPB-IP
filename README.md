@@ -5,29 +5,31 @@ A manually uploaded file, URLs and domains are supported as sources.
 
 ## Install or Update
 
-The installer detects the CPU architecture, installs dependencies if missing, downloads and verifies the matching binary, installs `bpb-ip` service and starts an initial scan.  
-Running the installer again gets the scanner updated while preserving configs.
+The installer detects the CPU architecture, installs dependencies if missing, downloads and verifies the matching release, then installs and enables the service without starting it on a fresh install.  
+Running it again updates the binary and service unit without changing your existing configuration; a running service is restarted, while a stopped service stays stopped.
 
 ```sh
 curl -fsSL https://github.com/bia-pain-bache/BPB-IP/releases/latest/download/install.sh | sudo bash
 ```
 
-On first install, it interactively asks for the Cloudflare zone ID, dedicated DNS hostname, and API token.
-Create a Cloudflare API token with **DNS: Edit** permission scoped to that zone.
+After a fresh install, configure `/opt/bpb-ip/config.json` with at least one source URL or domain, along with the Cloudflare zone ID, hostname, and API token. Alternatively, add port 443 Proxy IPs to `/opt/bpb-ip/list.txt`.  
+Create a Cloudflare API token with `DNS: Edit` permission scoped to that zone.
+
+Then start the service:
+
+```sh
+sudoedit /opt/bpb-ip/config.json
+sudo systemctl enable --now bpb-ip.service
+```
 
 - The service updates only A/AAAA records at the configured hostname, sets them DNS-only, and leaves other record types untouched.
 - A failed or empty source is logged while other inputs are used.
 - If no proxy IPs are collected from sources, scanning is skipped.
 - If none pass, the run fails without modifying DNS records.
-- The installer supports Linux `386`, `amd64`, `ARMv5/6/7`, `arm64`, `loong64`, `MIPS/MIPSLE`, `MIPS64/MIPS64LE`, `ppc64`, `ppc64le`, `riscv64`, and `s390x`.
+- The installer supports Linux `386`, `amd64`, `ARMv5/6/7`, `arm64`, `loong64`, `MIPS/MIPSLE`, `MIPS64/MIPS64LE`, `ppc64`, `ppc64le`, `riscv64` and `s390x`.
 
 > [!WARNING]
 > It requires systemd; non-systemd hosts need an equivalent service manager configured manually.
-
-## Configuration
-
-Configuration file is accessible at `/opt/bpb-ip/config.json`.  
-Changes are applied by manually restarting service or waiting for the next scan interval to be automatically reloaded by the scanner itself. Please do not touch any fields except `scanInterval`, `sourceUrls` and `sourceDomains` unless you are a pro user.
 
 ## Status and Logs
 
@@ -46,5 +48,3 @@ go test ./...
 go vet ./...
 go build .
 ```
-
-Special thanks to [NiREvil](https://github.com/NiREvil)

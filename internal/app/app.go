@@ -54,6 +54,9 @@ func Run(options Options) error {
 		options.Logger.Printf("list.txt: failed to read %s: %v", options.ListPath, err)
 		localContents = nil
 	}
+	if err := validateSources(config, string(localContents), options.ListPath); err != nil {
+		return err
+	}
 	endpoints := CollectEndpoints(options.Context, string(localContents), config, options.Logger, nil)
 	if len(endpoints) == 0 {
 		options.Logger.Printf("no port 443 endpoints found across list.txt, sourceUrls, and sourceDomains; skipping scan")
@@ -88,6 +91,51 @@ func Run(options Options) error {
 	}
 	options.Logger.Printf("updated DNS-only A/AAAA records for %s", recordName)
 	return nil
+}
+
+func ValidateSources(config Config, listPath string) error {
+	if hasRemoteSources(config) {
+		return nil
+	}
+	localContents, err := os.ReadFile(listPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			localContents = nil
+		} else {
+			return fmt.Errorf("read source list %s: %w", listPath, err)
+		}
+	}
+	return validateSources(config, string(localContents), listPath)
+}
+
+func validateSources(config Config, localContents, listPath string) error {
+	if hasRemoteSources(config) {
+		return nil
+	}
+	endpoints, err := ParseEndpoints(localContents)
+	if err != nil {
+		return fmt.Errorf("no usable sources configured; invalid endpoint data in %s: %w", listPath, err)
+	}
+	for _, endpoint := range endpoints {
+		if endpoint.Port == 443 {
+			return nil
+		}
+	}
+	return fmt.Errorf("no sources configured: add a source URL or domain to config, or a port 443 endpoint to %s", listPath)
+}
+
+func hasRemoteSources(config Config) bool {
+	for _, source := range config.SourceURLs {
+		if strings.TrimSpace(source) != "" {
+			return true
+		}
+	}
+	for _, domain := range config.SourceDomains {
+		if strings.TrimSpace(domain) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func ConfigureCloudflare(path string, input io.Reader) error {

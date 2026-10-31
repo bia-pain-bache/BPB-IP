@@ -5,14 +5,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=bpb-ip
-Group=bpb-ip
 WorkingDirectory=/opt/bpb-ip
 ExecStart=/opt/bpb-ip/bpb-ip --config /opt/bpb-ip/config.json --list /opt/bpb-ip/list.txt --output /opt/bpb-ip/results/ips.json
 StandardOutput=append:/var/log/bpb-ip.log
 StandardError=inherit
 Restart=on-failure
 RestartSec=10s
+RestartPreventExitStatus=1
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
