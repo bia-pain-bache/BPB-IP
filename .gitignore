@@ -1,0 +1,14 @@
+*
+!.github
+!.github/**
+!main.go
+!internal
+!internal/**
+!deploy
+!deploy/**
+!install.sh
+!go.mod
+!.gitignore
+!config.json
+!list.txt
+!README.md

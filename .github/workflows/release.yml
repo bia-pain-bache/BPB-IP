@@ -1,0 +1,126 @@
+name: Go build and release
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+  build:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goarch: "386", asset: "386" }
+          - { goarch: "amd64", asset: "amd64" }
+          - { goarch: "arm", goarm: "5", asset: "armv5" }
+          - { goarch: "arm", goarm: "6", asset: "armv6" }
+          - { goarch: "arm", goarm: "7", asset: "armv7" }
+          - { goarch: "arm64", asset: "arm64" }
+          - { goarch: "loong64", asset: "loong64" }
+          - { goarch: "mips", gomips: "softfloat", asset: "mips" }
+          - { goarch: "mipsle", gomips: "softfloat", asset: "mipsle" }
+          - { goarch: "mips64", gomips64: "softfloat", asset: "mips64" }
+          - { goarch: "mips64le", gomips64: "softfloat", asset: "mips64le" }
+          - { goarch: "ppc64", asset: "ppc64" }
+          - { goarch: "ppc64le", asset: "ppc64le" }
+          - { goarch: "riscv64", asset: "riscv64" }
+          - { goarch: "s390x", asset: "s390x" }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+
+      - name: Build Linux binary
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          GOMIPS64: ${{ matrix.gomips64 }}
+          ASSET_ARCH: ${{ matrix.asset }}
+        run: |
+          mkdir -p dist
+          if [[ -n "${GOARM:-}" ]]; then export GOARM; else unset GOARM; fi
+          if [[ -n "${GOMIPS:-}" ]]; then export GOMIPS; else unset GOMIPS; fi
+          if [[ -n "${GOMIPS64:-}" ]]; then export GOMIPS64; else unset GOMIPS64; fi
+          CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -trimpath -ldflags="-s -w" \
+            -o "dist/bpb-ip-linux-${ASSET_ARCH}" .
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bpb-ip-linux-${{ matrix.asset }}
+          path: dist/bpb-ip-linux-${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged release
+        uses: actions/checkout@v4
+
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bpb-ip-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare release assets
+        run: |
+          for binary in dist/bpb-ip-linux-*; do
+            arch="${binary##*linux-}"
+            package_dir="dist/package-${arch}"
+            mkdir -p "$package_dir"
+            cp "$binary" "$package_dir/bpb-ip"
+            cp deploy/bpb-ip.service "$package_dir/bpb-ip.service"
+            cp config.json "$package_dir/config.json"
+            (cd "$package_dir" && zip -q "../bpb-ip-linux-${arch}.zip" bpb-ip bpb-ip.service config.json)
+            rm -rf "$package_dir" "$binary"
+          done
+          cp install.sh dist/install.sh
+          cd dist
+          sha256sum bpb-ip-linux-*.zip install.sh > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --verify-tag \
+            --title "BPB IP Scanner ${GITHUB_REF_NAME}" \
+            --generate-notes

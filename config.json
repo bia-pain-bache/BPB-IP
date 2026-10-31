@@ -1,0 +1,18 @@
+{
+  "scanInterval": "30m",
+  "probeUrl": "https://speed.cloudflare.com/__down",
+  "expectedBytes": 10000,
+  "timeoutMs": 3000,
+  "fetchTimeoutMs": 15000,
+  "concurrentRuns": 10,
+  "trials": 3,
+  "sourceUrls": [
+    "https://raw.githubusercontent.com/NiREvil/vless/main/sub/country_proxies/DE.txt"
+  ],
+  "sourceDomains": [],
+  "cloudflare": {
+    "zoneId": "",
+    "recordName": "",
+    "apiToken": ""
+  }
+}
