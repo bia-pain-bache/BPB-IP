@@ -26,8 +26,9 @@ sudo systemctl enable --now bpb-ip.service
 - A failed or empty source is logged while other inputs are used.
 - If no proxy IPs are collected from sources, scanning is skipped.
 - Before updating DNS, the service counts zone records outside the managed hostname and uses the remaining slots (up to 200) for the fastest healthy IPs.
+- It patches existing A/AAAA records, deletes records beyond the selected set, and posts only the remaining IPs. The CSV lists old DNS IPs no longer present as `deleted`.
 - If none pass, the run fails without modifying DNS records.
-- Each scan writes a `results-YYYY-MM-DD--HH-mm-ss.csv` file to `/opt/bpb-ip/results/`, with `IP`, `Status`, `Speed`, and `Error` columns. Speed is shown in MiB/s for passed IPs only; passed IPs are sorted fastest-first, failed IPs follow in scan order, and removed DNS IPs are listed last as `deleted`.
+- Each scan writes a `results-YYYY-MM-DD--HH-mm-ss.csv` file to `/opt/bpb-ip/results/`, with `IP`, `Status`, `Speed`, and `Error` columns. Speed is shown in MiB/s for passed IPs only; passed IPs are sorted fastest-first, failed IPs follow in scan order, and old DNS IPs no longer present are listed last as `deleted`.
 - The installer supports Linux `386`, `amd64`, `ARMv5/6/7`, `arm64`, `loong64`, `MIPS/MIPSLE`, `MIPS64/MIPS64LE`, `ppc64`, `ppc64le`, `riscv64` and `s390x`.
 
 > [!WARNING]

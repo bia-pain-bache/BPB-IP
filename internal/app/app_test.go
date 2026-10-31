@@ -448,6 +448,7 @@ func TestReconcileDNSBatchesChangesAndPreservesOtherRecordTypes(t *testing.T) {
 		}
 		mu.Lock()
 		calls = append(calls, r.Method+" "+r.URL.Path)
+		requestNumber := len(calls)
 		mu.Unlock()
 
 		switch {
@@ -464,50 +465,41 @@ func TestReconcileDNSBatchesChangesAndPreservesOtherRecordTypes(t *testing.T) {
 				{"id":"cname","type":"CNAME","name":"proxy.example.com","content":"elsewhere.example.com","ttl":1,"proxied":false}
 			]}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone-id/dns_records/batch":
-			var body struct {
-				Deletes []dnsRecordDelete `json:"deletes"`
-				Posts   []json.RawMessage `json:"posts"`
-			}
+			var body dnsBatchPayload
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Error(err)
 			}
-			wantDeleteIDs := []string{"extra-a", "keep", "old-a", "old-aaaa"}
-			if len(body.Deletes) != len(wantDeleteIDs) {
-				t.Errorf("batch deletes = %#v", body.Deletes)
-			} else {
-				for i, id := range wantDeleteIDs {
-					if body.Deletes[i].ID != id {
-						t.Errorf("batch delete %d = %#v, want ID %q", i, body.Deletes[i], id)
+			if requestNumber == 2 {
+				if len(body.Patches) != 3 || len(body.Deletes) != 1 || len(body.Posts) != 0 {
+					t.Errorf("first batch should patch and delete only: %#v", body)
+				}
+				if len(body.Deletes) == 1 && body.Deletes[0].ID != "old-a" {
+					t.Errorf("unexpected record deletion: %#v", body.Deletes)
+				}
+				patches := map[string]dnsRecordPatch{}
+				for _, patch := range body.Patches {
+					patches[patch.ID] = patch
+					if patch.Proxied || patch.TTL != 1 || patch.Name != "proxy.example.com" {
+						t.Errorf("patched record is not DNS-only with automatic TTL: %#v", patch)
 					}
 				}
-			}
-			if len(body.Posts) != 4 {
-				t.Fatalf("batch posts = %#v, want all four desired records", body.Posts)
-			}
-			posts := map[string]dnsRecordPayload{}
-			for _, rawPost := range body.Posts {
-				var post dnsRecordPayload
-				if err := json.Unmarshal(rawPost, &post); err != nil {
-					t.Error(err)
+				if patches["keep"].Content != "192.0.2.1" ||
+					patches["extra-a"].Content != "192.0.2.3" ||
+					patches["old-aaaa"].Content != "2001:db8::1" {
+					t.Errorf("patches did not preserve matching IPs and update the remaining records: %#v", patches)
 				}
-				var fields map[string]json.RawMessage
-				if err := json.Unmarshal(rawPost, &fields); err != nil {
-					t.Error(err)
+			} else {
+				if len(body.Patches) != 0 || len(body.Posts) != 1 {
+					t.Errorf("second batch should post the remaining record only: %#v", body)
 				}
-				if _, hasID := fields["id"]; hasID {
-					t.Error("new record payload must not include a read-only ID")
+				if len(body.Posts) == 1 &&
+					(body.Posts[0].Type != "AAAA" || body.Posts[0].Content != "2001:db8::3") {
+					t.Errorf("unexpected remaining post: %#v", body.Posts[0])
 				}
-				if post.Proxied || post.TTL != 1 || post.Name != "proxy.example.com" {
-					t.Errorf("new record is not DNS-only with automatic TTL: %#v", post)
-				}
-				posts[post.Type+":"+post.Content] = post
-			}
-			for _, desired := range []string{
-				"A:192.0.2.1", "A:192.0.2.3",
-				"AAAA:2001:db8::1", "AAAA:2001:db8::3",
-			} {
-				if _, ok := posts[desired]; !ok {
-					t.Errorf("batch missing desired record %q: %#v", desired, posts)
+				for _, post := range body.Posts {
+					if post.Proxied || post.TTL != 1 || post.Name != "proxy.example.com" {
+						t.Errorf("new record is not DNS-only with automatic TTL: %#v", post)
+					}
 				}
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -537,8 +529,8 @@ func TestReconcileDNSBatchesChangesAndPreservesOtherRecordTypes(t *testing.T) {
 	}
 	wantDeleted := []Endpoint{
 		{IP: netip.MustParseAddr("192.0.2.2"), Port: 443},
-		{IP: netip.MustParseAddr("2001:db8::2"), Port: 443},
 		{IP: netip.MustParseAddr("192.0.2.4"), Port: 443},
+		{IP: netip.MustParseAddr("2001:db8::2"), Port: 443},
 	}
 	if !reflect.DeepEqual(deleted, wantDeleted) {
 		t.Fatalf("deleted DNS endpoints = %#v, want %#v", deleted, wantDeleted)
@@ -546,8 +538,248 @@ func TestReconcileDNSBatchesChangesAndPreservesOtherRecordTypes(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(calls) != 2 || calls[1] != "POST /zones/zone-id/dns_records/batch" {
-		t.Fatalf("expected one list and one batch request, got %v", calls)
+	if len(calls) != 3 || calls[0] != "GET /zones/zone-id/dns_records" ||
+		calls[1] != "POST /zones/zone-id/dns_records/batch" ||
+		calls[2] != "POST /zones/zone-id/dns_records/batch" {
+		t.Fatalf("expected list, patch/delete, and post requests, got %v", calls)
+	}
+}
+
+func TestReconcileDNSPatchesExistingAndPostsRemainder(t *testing.T) {
+	records := make(map[string]dnsRecord)
+	endpoints := make([]Endpoint, 0, 184)
+	for i := 1; i <= 184; i++ {
+		ip := netip.MustParseAddr(fmt.Sprintf("192.0.2.%d", i))
+		endpoints = append(endpoints, Endpoint{IP: ip, Port: 443})
+	}
+	for i := 1; i <= 100; i++ {
+		id := fmt.Sprintf("record-%03d", i)
+		records[id] = dnsRecord{
+			ID: id, Type: "A", Name: "proxy.example.com", Content: fmt.Sprintf("198.51.100.%d", i),
+		}
+	}
+
+	batchCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/zones/zone-id/dns_records":
+			current := make([]dnsRecord, 0, len(records))
+			for _, record := range records {
+				current = append(current, record)
+			}
+			_ = json.NewEncoder(w).Encode(cloudflareEnvelope[[]dnsRecord]{
+				Result: current, Success: true,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone-id/dns_records/batch":
+			var batch dnsBatchPayload
+			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+				t.Error(err)
+				http.Error(w, "invalid batch", http.StatusBadRequest)
+				return
+			}
+			batchCalls++
+			if batchCalls == 1 && (len(batch.Patches) != 100 || len(batch.Posts) != 0) {
+				t.Errorf("first batch should patch all existing records: %#v", batch)
+			}
+			if batchCalls == 2 && (len(batch.Patches) != 0 || len(batch.Posts) != 84) {
+				t.Errorf("second batch should post only the remaining records: %#v", batch)
+			}
+			if len(batch.Patches)+len(batch.Posts) > 200 {
+				t.Errorf("batch exceeds Cloudflare operation limit: %#v", batch)
+			}
+			for _, patch := range batch.Patches {
+				record := records[patch.ID]
+				record.Type = patch.Type
+				record.Name = patch.Name
+				record.Content = patch.Content
+				record.TTL = patch.TTL
+				record.Proxied = patch.Proxied
+				records[patch.ID] = record
+			}
+			for _, post := range batch.Posts {
+				for _, record := range records {
+					if record.Type == post.Type && record.Content == post.Content {
+						t.Errorf("posted duplicate %s record while the original still existed", post.Content)
+					}
+				}
+				id := fmt.Sprintf("new-%03d", len(records))
+				records[id] = dnsRecord{
+					ID: id, Type: post.Type, Name: post.Name, Content: post.Content,
+				}
+			}
+			_, _ = io.WriteString(w, `{"success":true,"result":{"deletes":[],"posts":[]}}`)
+		default:
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := CloudflareClient{
+		ZoneID: "zone-id", Token: "test-token", BaseURL: server.URL, Client: server.Client(),
+	}
+	if err := client.ReconcileDNS(context.Background(), "proxy.example.com", endpoints); err != nil {
+		t.Fatal(err)
+	}
+	if batchCalls != 2 {
+		t.Fatalf("batch request count = %d, want patch and post requests", batchCalls)
+	}
+	if len(records) != len(endpoints) {
+		t.Fatalf("final record count = %d, want %d", len(records), len(endpoints))
+	}
+}
+
+func TestReconcileDNSPostsWhenHostnameHasNoRecords(t *testing.T) {
+	batchCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/zones/zone-id/dns_records":
+			_, _ = io.WriteString(w, `{"success":true,"result_info":{"total_pages":1},"result":[]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone-id/dns_records/batch":
+			var batch dnsBatchPayload
+			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+				t.Error(err)
+			}
+			batchCalls++
+			if len(batch.Patches) != 0 || len(batch.Posts) != 1 ||
+				batch.Posts[0].Content != "192.0.2.1" {
+				t.Errorf("expected a post-only batch for the new hostname: %#v", batch)
+			}
+			_, _ = io.WriteString(w, `{"success":true,"result":{"posts":[]}}`)
+		default:
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := CloudflareClient{
+		ZoneID: "zone-id", Token: "test-token", BaseURL: server.URL, Client: server.Client(),
+	}
+	endpoints := []Endpoint{{IP: netip.MustParseAddr("192.0.2.1"), Port: 443}}
+	if err := client.ReconcileDNS(context.Background(), "proxy.example.com", endpoints); err != nil {
+		t.Fatal(err)
+	}
+	if batchCalls != 1 {
+		t.Fatalf("batch request count = %d, want one post batch", batchCalls)
+	}
+}
+
+func TestReconcileDNSDeletesRecordsBeyondDesiredSet(t *testing.T) {
+	records := []dnsRecord{
+		{ID: "keep", Type: "A", Name: "proxy.example.com", Content: "192.0.2.1"},
+		{ID: "old-a", Type: "A", Name: "proxy.example.com", Content: "192.0.2.2"},
+		{ID: "old-aaaa", Type: "AAAA", Name: "proxy.example.com", Content: "2001:db8::2"},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/zones/zone-id/dns_records":
+			_ = json.NewEncoder(w).Encode(cloudflareEnvelope[[]dnsRecord]{
+				Result: records, Success: true,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone-id/dns_records/batch":
+			var batch dnsBatchPayload
+			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+				t.Error(err)
+			}
+			if len(batch.Patches) != 1 || batch.Patches[0].ID != "keep" ||
+				len(batch.Deletes) != 2 || len(batch.Posts) != 0 {
+				t.Errorf("expected one patch and two deletes, got %#v", batch)
+			}
+			if len(batch.Deletes) == 2 &&
+				(batch.Deletes[0].ID != "old-a" || batch.Deletes[1].ID != "old-aaaa") {
+				t.Errorf("unexpected records deleted: %#v", batch.Deletes)
+			}
+			_, _ = io.WriteString(w, `{"success":true,"result":{"deletes":[],"patches":[]}}`)
+		default:
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := CloudflareClient{
+		ZoneID: "zone-id", Token: "test-token", BaseURL: server.URL, Client: server.Client(),
+	}
+	endpoints := []Endpoint{{IP: netip.MustParseAddr("192.0.2.3"), Port: 443}}
+	deleted, err := client.ReconcileDNSWithDeleted(context.Background(), "proxy.example.com", endpoints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeleted := []Endpoint{
+		{IP: netip.MustParseAddr("192.0.2.1"), Port: 443},
+		{IP: netip.MustParseAddr("192.0.2.2"), Port: 443},
+		{IP: netip.MustParseAddr("2001:db8::2"), Port: 443},
+	}
+	if !reflect.DeepEqual(deleted, wantDeleted) {
+		t.Fatalf("deleted DNS endpoints = %#v, want %#v", deleted, wantDeleted)
+	}
+}
+
+func TestReconcileDNSWithEmptySelectionDeletesManagedRecords(t *testing.T) {
+	record := dnsRecord{
+		ID: "old", Type: "A", Name: "proxy.example.com", Content: "192.0.2.9",
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/zones/zone-id/dns_records":
+			_ = json.NewEncoder(w).Encode(cloudflareEnvelope[[]dnsRecord]{
+				Result: []dnsRecord{record}, Success: true,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone-id/dns_records/batch":
+			var batch dnsBatchPayload
+			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+				t.Error(err)
+			}
+			if len(batch.Deletes) != 1 || batch.Deletes[0].ID != record.ID ||
+				len(batch.Patches) != 0 || len(batch.Posts) != 0 {
+				t.Errorf("expected managed record deletion, got %#v", batch)
+			}
+			_, _ = io.WriteString(w, `{"success":true,"result":{"deletes":[]}}`)
+		default:
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := CloudflareClient{
+		ZoneID: "zone-id", Token: "test-token", BaseURL: server.URL, Client: server.Client(),
+	}
+	deleted, err := client.ReconcileDNSWithDeleted(context.Background(), "proxy.example.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeleted := []Endpoint{{IP: netip.MustParseAddr("192.0.2.9"), Port: 443}}
+	if !reflect.DeepEqual(deleted, wantDeleted) {
+		t.Fatalf("deleted DNS endpoints = %#v, want %#v", deleted, wantDeleted)
+	}
+}
+
+func TestBuildDNSChangeBatchesKeepsEachBatchWithinCloudflareLimit(t *testing.T) {
+	patches := make([]dnsRecordPatch, cloudflareMaxBatchOperations+1)
+	deletes := make([]dnsRecordDelete, cloudflareMaxBatchOperations+1)
+	for i := range patches {
+		patches[i].ID = fmt.Sprintf("patch-%03d", i)
+		deletes[i].ID = fmt.Sprintf("delete-%03d", i)
+	}
+
+	batches := buildDNSChangeBatches(patches, deletes)
+	if len(batches) != 3 {
+		t.Fatalf("batch count = %d, want 3", len(batches))
+	}
+	patchCount, deleteCount := 0, 0
+	for index, batch := range batches {
+		operationCount := len(batch.Patches) + len(batch.Deletes)
+		if operationCount == 0 || operationCount > cloudflareMaxBatchOperations {
+			t.Errorf("batch %d has %d operations", index, operationCount)
+		}
+		patchCount += len(batch.Patches)
+		deleteCount += len(batch.Deletes)
+	}
+	if patchCount != len(patches) || deleteCount != len(deletes) {
+		t.Fatalf("batches contain %d patches and %d deletes; want %d and %d",
+			patchCount, deleteCount, len(patches), len(deletes))
 	}
 }
 
@@ -575,7 +807,7 @@ func TestReconcileDNSRetriesTransientCloudflareFailures(t *testing.T) {
 			_, _ = fmt.Fprintf(w, `{"success":true,"result_info":{"total_pages":1},"result":[{"id":%q,"type":"A","name":"proxy.example.com","content":"192.0.2.9","ttl":1,"proxied":false}]}`, recordID)
 		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone-id/dns_records/batch":
 			var body struct {
-				Deletes []dnsRecordDelete `json:"deletes"`
+				Patches []dnsRecordPatch `json:"patches"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Error(err)
@@ -585,15 +817,15 @@ func TestReconcileDNSRetriesTransientCloudflareFailures(t *testing.T) {
 			call := batchCalls
 			mu.Unlock()
 			if call == 1 {
-				if len(body.Deletes) != 1 || body.Deletes[0].ID != "old" {
-					t.Errorf("first batch deletes = %#v", body.Deletes)
+				if len(body.Patches) != 1 || body.Patches[0].ID != "old" {
+					t.Errorf("first batch patches = %#v", body.Patches)
 				}
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_, _ = io.WriteString(w, `{"success":false,"errors":[{"code":1000,"message":"temporarily unavailable"}]}`)
 				return
 			}
-			if len(body.Deletes) != 1 || body.Deletes[0].ID != "latest" {
-				t.Errorf("retried batch reused stale record IDs: %#v", body.Deletes)
+			if len(body.Patches) != 1 || body.Patches[0].ID != "latest" {
+				t.Errorf("retried patch batch changed record IDs: %#v", body.Patches)
 			}
 			_, _ = io.WriteString(w, `{"success":true,"result":{"deletes":[],"posts":[]}}`)
 		default:

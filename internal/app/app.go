@@ -127,10 +127,22 @@ func Run(options Options) error {
 		availableSlots,
 	)
 	if len(uploadEndpoints) == 0 {
-		if _, err := writeScanResults(options.ResultsDir, results, nil, time.Now()); err != nil {
-			return err
+		deleted, reconcileErr := client.ReconcileDNSWithDeleted(options.Context, recordName, nil)
+		path, writeErr := writeScanResults(options.ResultsDir, results, deleted, time.Now())
+		if writeErr != nil {
+			if reconcileErr != nil {
+				return fmt.Errorf("%w (also failed to write scan report: %v)", reconcileErr, writeErr)
+			}
+			return writeErr
 		}
-		return fmt.Errorf("Cloudflare DNS record limit reached: no record slots available outside %s; existing records were preserved", recordName)
+		if reconcileErr != nil {
+			return reconcileErr
+		}
+		options.Logger.Printf("wrote scan report to %s", path)
+		if len(deleted) > 0 {
+			return fmt.Errorf("Cloudflare DNS record limit reached: no record slots available outside %s; removed %d managed IP records", recordName, len(deleted))
+		}
+		return fmt.Errorf("Cloudflare DNS record limit reached: no record slots available outside %s", recordName)
 	}
 	deleted, reconcileErr := client.ReconcileDNSWithDeleted(options.Context, recordName, uploadEndpoints)
 	path, writeErr := writeScanResults(options.ResultsDir, results, deleted, time.Now())

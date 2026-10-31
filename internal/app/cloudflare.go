@@ -19,9 +19,10 @@ import (
 const cloudflareAPIURL = "https://api.cloudflare.com/client/v4"
 
 const (
-	cloudflareMaxAttempts = 3
-	cloudflareRetryDelay  = 250 * time.Millisecond
-	cloudflareMaxRetry    = 5 * time.Second
+	cloudflareMaxAttempts        = 3
+	cloudflareRetryDelay         = 250 * time.Millisecond
+	cloudflareMaxRetry           = 5 * time.Second
+	cloudflareMaxBatchOperations = 200
 )
 
 type CloudflareClient struct {
@@ -54,12 +55,25 @@ type dnsRecordPayload struct {
 	Settings map[string]any `json:"settings,omitempty"`
 }
 
+type dnsRecordPatch struct {
+	ID       string         `json:"id"`
+	Type     string         `json:"type"`
+	Name     string         `json:"name"`
+	Content  string         `json:"content"`
+	TTL      int            `json:"ttl"`
+	Proxied  bool           `json:"proxied"`
+	Comment  string         `json:"comment,omitempty"`
+	Tags     []string       `json:"tags,omitempty"`
+	Settings map[string]any `json:"settings,omitempty"`
+}
+
 type dnsRecordDelete struct {
 	ID string `json:"id"`
 }
 
 type dnsBatchPayload struct {
 	Deletes []dnsRecordDelete  `json:"deletes,omitempty"`
+	Patches []dnsRecordPatch   `json:"patches,omitempty"`
 	Posts   []dnsRecordPayload `json:"posts,omitempty"`
 }
 
@@ -89,6 +103,9 @@ func (e retryableCloudflareError) Unwrap() error {
 }
 
 func (c CloudflareClient) ReconcileDNS(ctx context.Context, recordName string, endpoints []Endpoint) error {
+	if len(endpoints) == 0 {
+		return fmt.Errorf("refusing to update DNS with an empty endpoint set")
+	}
 	_, err := c.ReconcileDNSWithDeleted(ctx, recordName, endpoints)
 	return err
 }
@@ -103,11 +120,8 @@ func (c CloudflareClient) ReconcileDNSWithDeleted(ctx context.Context, recordNam
 	if strings.TrimSpace(c.Token) == "" {
 		return nil, fmt.Errorf("Cloudflare API token is empty")
 	}
-	if len(endpoints) == 0 {
-		return nil, fmt.Errorf("refusing to update DNS with an empty endpoint set")
-	}
-
-	desired := make(map[string]map[string]struct{})
+	desired := make([]dnsRecordPayload, 0, len(endpoints))
+	seen := make(map[string]struct{}, len(endpoints))
 	for _, endpoint := range endpoints {
 		ip := endpoint.IP.Unmap()
 		if endpoint.Port != 443 || !ip.IsValid() {
@@ -117,87 +131,222 @@ func (c CloudflareClient) ReconcileDNSWithDeleted(ctx context.Context, recordNam
 		if ip.Is6() {
 			recordType = "AAAA"
 		}
-		if desired[recordType] == nil {
-			desired[recordType] = make(map[string]struct{})
+		content := ip.String()
+		key := recordType + ":" + content
+		if _, found := seen[key]; found {
+			continue
 		}
-		desired[recordType][ip.String()] = struct{}{}
+		seen[key] = struct{}{}
+		desired = append(desired, dnsRecord{
+			Type: recordType, Name: recordName, Content: content, TTL: 1, Proxied: false,
+		}.payload())
 	}
-	if len(desired) == 0 {
+	if len(endpoints) > 0 && len(desired) == 0 {
 		return nil, fmt.Errorf("refusing to update DNS: no valid port 443 IP addresses")
 	}
 
+	path := "/zones/" + url.PathEscape(c.ZoneID) + "/dns_records/batch"
+	var originalRecords []dnsRecord
+	originalRecordsLoaded := false
+	changesApplied := false
 	for attempt := 1; attempt <= cloudflareMaxAttempts; attempt++ {
 		records, err := c.listRecords(ctx, recordName)
 		if err != nil {
-			return nil, err
-		}
-
-		batch := dnsBatchPayload{}
-		for _, recordType := range []string{"A", "AAAA"} {
-			addresses := make([]string, 0, len(desired[recordType]))
-			for address := range desired[recordType] {
-				addresses = append(addresses, address)
+			if !isRetryableCloudflareError(err) || attempt == cloudflareMaxAttempts {
+				if changesApplied {
+					return removedDNSAddresses(originalRecords, desired), err
+				}
+				return nil, err
 			}
-			sort.Strings(addresses)
+			if err := waitCloudflareRetry(ctx, err, attempt); err != nil {
+				if changesApplied {
+					return removedDNSAddresses(originalRecords, desired), err
+				}
+				return nil, err
+			}
+			continue
+		}
+		if !originalRecordsLoaded {
+			originalRecords = append([]dnsRecord(nil), records...)
+			originalRecordsLoaded = true
+		}
 
-			for _, address := range addresses {
-				batch.Posts = append(batch.Posts, dnsRecord{
-					Type: recordType, Name: recordName, Content: address, TTL: 1, Proxied: false,
-				}.payload())
+		patches, deletes, remaining := buildDNSChanges(records, desired)
+		retryErr := error(nil)
+		for _, batch := range buildDNSChangeBatches(patches, deletes) {
+			var response cloudflareEnvelope[json.RawMessage]
+			err := c.request(ctx, http.MethodPost, path, batch, &response)
+			if err != nil {
+				retryErr = err
+				break
 			}
 		}
-		for _, record := range records {
-			batch.Deletes = append(batch.Deletes, dnsRecordDelete{ID: record.ID})
-		}
-		if len(batch.Deletes)+len(batch.Posts) == 0 {
-			return nil, nil
-		}
-
-		sort.Slice(batch.Deletes, func(i, j int) bool {
-			return batch.Deletes[i].ID < batch.Deletes[j].ID
-		})
-		sort.Slice(batch.Posts, func(i, j int) bool {
-			if batch.Posts[i].Type != batch.Posts[j].Type {
-				return batch.Posts[i].Type < batch.Posts[j].Type
+		if retryErr == nil {
+			changesApplied = true
+			for offset := 0; offset < len(remaining); offset += cloudflareMaxBatchOperations {
+				end := min(offset+cloudflareMaxBatchOperations, len(remaining))
+				var response cloudflareEnvelope[json.RawMessage]
+				retryErr = c.request(
+					ctx,
+					http.MethodPost,
+					path,
+					dnsBatchPayload{Posts: remaining[offset:end]},
+					&response,
+				)
+				if retryErr != nil {
+					break
+				}
 			}
-			return batch.Posts[i].Content < batch.Posts[j].Content
-		})
-
-		var response cloudflareEnvelope[json.RawMessage]
-		path := "/zones/" + url.PathEscape(c.ZoneID) + "/dns_records/batch"
-		err = c.request(ctx, http.MethodPost, path, batch, &response)
-		if err == nil {
-			return deletedDNSAddresses(records, desired), nil
 		}
-		if !isRetryableCloudflareError(err) || attempt == cloudflareMaxAttempts {
-			return nil, fmt.Errorf("apply Cloudflare DNS batch for %s: %w", recordName, err)
+		if retryErr == nil {
+			return removedDNSAddresses(originalRecords, desired), nil
 		}
-		if err := waitCloudflareRetry(ctx, err, attempt); err != nil {
-			return nil, fmt.Errorf("retry Cloudflare DNS batch for %s: %w", recordName, err)
+		if !isRetryableCloudflareError(retryErr) || attempt == cloudflareMaxAttempts {
+			if changesApplied {
+				return removedDNSAddresses(originalRecords, desired), fmt.Errorf("reconcile Cloudflare DNS records for %s: %w", recordName, retryErr)
+			}
+			return nil, fmt.Errorf("reconcile Cloudflare DNS records for %s: %w", recordName, retryErr)
+		}
+		if err := waitCloudflareRetry(ctx, retryErr, attempt); err != nil {
+			if changesApplied {
+				return removedDNSAddresses(originalRecords, desired), fmt.Errorf("retry Cloudflare DNS records for %s: %w", recordName, err)
+			}
+			return nil, fmt.Errorf("retry Cloudflare DNS records for %s: %w", recordName, err)
 		}
 	}
-	return nil, fmt.Errorf("apply Cloudflare DNS batch for %s: retry attempts exhausted", recordName)
+	return nil, fmt.Errorf("reconcile Cloudflare DNS records for %s: retry attempts exhausted", recordName)
 }
 
-func deletedDNSAddresses(records []dnsRecord, desired map[string]map[string]struct{}) []Endpoint {
-	deleted := make([]Endpoint, 0)
-	seen := make(map[netip.Addr]struct{})
-	for _, record := range records {
-		ip, err := netip.ParseAddr(record.Content)
-		if err != nil {
-			continue
-		}
-		ip = ip.Unmap()
-		if _, retained := desired[record.Type][ip.String()]; retained {
-			continue
-		}
-		if _, exists := seen[ip]; exists {
-			continue
-		}
-		seen[ip] = struct{}{}
-		deleted = append(deleted, Endpoint{IP: ip, Port: 443})
+func buildDNSChanges(
+	records []dnsRecord,
+	desired []dnsRecordPayload,
+) ([]dnsRecordPatch, []dnsRecordDelete, []dnsRecordPayload) {
+	sortedRecords := append([]dnsRecord(nil), records...)
+	sort.Slice(sortedRecords, func(i, j int) bool {
+		return sortedRecords[i].ID < sortedRecords[j].ID
+	})
+	usedDesired := make([]bool, len(desired))
+	usedRecords := make([]bool, len(sortedRecords))
+	assignments := make([]int, len(sortedRecords))
+	for i := range assignments {
+		assignments[i] = -1
 	}
-	return deleted
+
+	for recordIndex, record := range sortedRecords {
+		for desiredIndex, target := range desired {
+			if usedDesired[desiredIndex] {
+				continue
+			}
+			if record.Type == target.Type &&
+				normalizedDNSContent(record.Content) == normalizedDNSContent(target.Content) {
+				usedRecords[recordIndex] = true
+				usedDesired[desiredIndex] = true
+				assignments[recordIndex] = desiredIndex
+				break
+			}
+		}
+	}
+
+	for recordIndex, record := range sortedRecords {
+		if usedRecords[recordIndex] {
+			continue
+		}
+		desiredIndex := -1
+		for index := range desired {
+			if !usedDesired[index] && desired[index].Type == record.Type {
+				desiredIndex = index
+				break
+			}
+		}
+		if desiredIndex < 0 {
+			continue
+		}
+		assignments[recordIndex] = desiredIndex
+		usedRecords[recordIndex] = true
+		usedDesired[desiredIndex] = true
+	}
+
+	patches := make([]dnsRecordPatch, 0)
+	deletes := make([]dnsRecordDelete, 0)
+	for recordIndex, desiredIndex := range assignments {
+		if desiredIndex < 0 {
+			deletes = append(deletes, dnsRecordDelete{ID: sortedRecords[recordIndex].ID})
+			continue
+		}
+		record := sortedRecords[recordIndex]
+		target := desired[desiredIndex]
+		patches = append(patches, dnsRecordPatch{
+			ID:       record.ID,
+			Type:     target.Type,
+			Name:     target.Name,
+			Content:  target.Content,
+			TTL:      target.TTL,
+			Proxied:  target.Proxied,
+			Comment:  target.Comment,
+			Tags:     target.Tags,
+			Settings: target.Settings,
+		})
+	}
+
+	remaining := make([]dnsRecordPayload, 0)
+	for index, target := range desired {
+		if !usedDesired[index] {
+			remaining = append(remaining, target)
+		}
+	}
+	return patches, deletes, remaining
+}
+
+func buildDNSChangeBatches(patches []dnsRecordPatch, deletes []dnsRecordDelete) []dnsBatchPayload {
+	batches := make([]dnsBatchPayload, 0)
+	for patchOffset, deleteOffset := 0, 0; patchOffset < len(patches) || deleteOffset < len(deletes); {
+		patchEnd := min(patchOffset+cloudflareMaxBatchOperations, len(patches))
+		patchCount := patchEnd - patchOffset
+		deleteEnd := min(
+			deleteOffset+cloudflareMaxBatchOperations-patchCount,
+			len(deletes),
+		)
+		batches = append(batches, dnsBatchPayload{
+			Patches: patches[patchOffset:patchEnd],
+			Deletes: deletes[deleteOffset:deleteEnd],
+		})
+		patchOffset = patchEnd
+		deleteOffset = deleteEnd
+	}
+	return batches
+}
+
+func removedDNSAddresses(records []dnsRecord, desired []dnsRecordPayload) []Endpoint {
+	retained := make(map[string]struct{}, len(desired))
+	for _, record := range desired {
+		retained[record.Type+":"+normalizedDNSContent(record.Content)] = struct{}{}
+	}
+	removed := make(map[netip.Addr]struct{})
+	for _, record := range records {
+		if _, remains := retained[record.Type+":"+normalizedDNSContent(record.Content)]; remains {
+			continue
+		}
+		ip, err := netip.ParseAddr(record.Content)
+		if err == nil {
+			removed[ip.Unmap()] = struct{}{}
+		}
+	}
+	endpoints := make([]Endpoint, 0, len(removed))
+	for ip := range removed {
+		endpoints = append(endpoints, Endpoint{IP: ip, Port: 443})
+	}
+	sort.Slice(endpoints, func(i, j int) bool {
+		return endpoints[i].IP.Compare(endpoints[j].IP) < 0
+	})
+	return endpoints
+}
+
+func normalizedDNSContent(content string) string {
+	ip, err := netip.ParseAddr(content)
+	if err != nil {
+		return content
+	}
+	return ip.Unmap().String()
 }
 
 func (c CloudflareClient) CountRecordsExcludingHostname(ctx context.Context, hostname string) (int, error) {
