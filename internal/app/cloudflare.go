@@ -4,16 +4,24 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/netip"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const cloudflareAPIURL = "https://api.cloudflare.com/client/v4"
+
+const (
+	cloudflareMaxAttempts = 3
+	cloudflareRetryDelay  = 250 * time.Millisecond
+	cloudflareMaxRetry    = 5 * time.Second
+)
 
 type CloudflareClient struct {
 	ZoneID  string
@@ -45,6 +53,15 @@ type dnsRecordPayload struct {
 	Settings map[string]any `json:"settings,omitempty"`
 }
 
+type dnsRecordDelete struct {
+	ID string `json:"id"`
+}
+
+type dnsBatchPayload struct {
+	Deletes []dnsRecordDelete  `json:"deletes,omitempty"`
+	Posts   []dnsRecordPayload `json:"posts,omitempty"`
+}
+
 type cloudflareEnvelope[T any] struct {
 	Result  T    `json:"result"`
 	Success bool `json:"success"`
@@ -55,6 +72,19 @@ type cloudflareEnvelope[T any] struct {
 	ResultInfo struct {
 		TotalPages int `json:"total_pages"`
 	} `json:"result_info"`
+}
+
+type retryableCloudflareError struct {
+	err        error
+	retryAfter time.Duration
+}
+
+func (e retryableCloudflareError) Error() string {
+	return e.err.Error()
+}
+
+func (e retryableCloudflareError) Unwrap() error {
+	return e.err
 }
 
 func (c CloudflareClient) ReconcileDNS(ctx context.Context, recordName string, endpoints []Endpoint) error {
@@ -90,57 +120,57 @@ func (c CloudflareClient) ReconcileDNS(ctx context.Context, recordName string, e
 		return fmt.Errorf("refusing to update DNS: no valid port 443 IP addresses")
 	}
 
-	records, err := c.listRecords(ctx, recordName)
-	if err != nil {
-		return err
-	}
-
-	kept := make(map[string]bool)
-	creates := make([]dnsRecord, 0)
-	for recordType, addresses := range desired {
-		for address := range addresses {
-			found := false
-			for _, record := range records {
-				if record.Type == recordType && sameIPContent(record.Content, address) &&
-					equalDNSName(record.Name, recordName) && !kept[record.ID] {
-					kept[record.ID] = true
-					found = true
-					if record.Proxied {
-						record.Proxied = false
-						if record.TTL < 1 {
-							record.TTL = 1
-						}
-						if err := c.updateRecord(ctx, record); err != nil {
-							return err
-						}
-					}
-					break
-				}
-			}
-			if !found {
-				creates = append(creates, dnsRecord{
-					Type: recordType, Name: recordName, Content: address, TTL: 1, Proxied: false,
-				})
-			}
-		}
-	}
-
-	// Add every new answer before removing old ones so an API failure cannot
-	// leave the managed hostname without any of its previously working answers.
-	for _, record := range creates {
-		if err := c.createRecord(ctx, record); err != nil {
+	for attempt := 1; attempt <= cloudflareMaxAttempts; attempt++ {
+		records, err := c.listRecords(ctx, recordName)
+		if err != nil {
 			return err
 		}
-	}
-	for _, record := range records {
-		if (record.Type == "A" || record.Type == "AAAA") &&
-			equalDNSName(record.Name, recordName) && !kept[record.ID] {
-			if err := c.deleteRecord(ctx, record.ID); err != nil {
-				return err
+
+		batch := dnsBatchPayload{}
+		for _, recordType := range []string{"A", "AAAA"} {
+			addresses := make([]string, 0, len(desired[recordType]))
+			for address := range desired[recordType] {
+				addresses = append(addresses, address)
+			}
+			sort.Strings(addresses)
+
+			for _, address := range addresses {
+				batch.Posts = append(batch.Posts, dnsRecord{
+					Type: recordType, Name: recordName, Content: address, TTL: 1, Proxied: false,
+				}.payload())
 			}
 		}
+		for _, record := range records {
+			batch.Deletes = append(batch.Deletes, dnsRecordDelete{ID: record.ID})
+		}
+		if len(batch.Deletes)+len(batch.Posts) == 0 {
+			return nil
+		}
+
+		sort.Slice(batch.Deletes, func(i, j int) bool {
+			return batch.Deletes[i].ID < batch.Deletes[j].ID
+		})
+		sort.Slice(batch.Posts, func(i, j int) bool {
+			if batch.Posts[i].Type != batch.Posts[j].Type {
+				return batch.Posts[i].Type < batch.Posts[j].Type
+			}
+			return batch.Posts[i].Content < batch.Posts[j].Content
+		})
+
+		var response cloudflareEnvelope[json.RawMessage]
+		path := "/zones/" + url.PathEscape(c.ZoneID) + "/dns_records/batch"
+		err = c.request(ctx, http.MethodPost, path, batch, &response)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableCloudflareError(err) || attempt == cloudflareMaxAttempts {
+			return fmt.Errorf("apply Cloudflare DNS batch for %s: %w", recordName, err)
+		}
+		if err := waitCloudflareRetry(ctx, err, attempt); err != nil {
+			return fmt.Errorf("retry Cloudflare DNS batch for %s: %w", recordName, err)
+		}
 	}
-	return nil
+	return fmt.Errorf("apply Cloudflare DNS batch for %s: retry attempts exhausted", recordName)
 }
 
 func (c CloudflareClient) listRecords(ctx context.Context, recordName string) ([]dnsRecord, error) {
@@ -153,7 +183,7 @@ func (c CloudflareClient) listRecords(ctx context.Context, recordName string) ([
 			"page":     []string{strconv.Itoa(page)},
 		}
 		var response cloudflareEnvelope[[]dnsRecord]
-		if err := c.request(ctx, http.MethodGet, "/zones/"+url.PathEscape(c.ZoneID)+"/dns_records?"+query.Encode(), nil, &response); err != nil {
+		if err := c.requestWithRetry(ctx, http.MethodGet, "/zones/"+url.PathEscape(c.ZoneID)+"/dns_records?"+query.Encode(), nil, &response); err != nil {
 			return nil, fmt.Errorf("list Cloudflare DNS records: %w", err)
 		}
 		for _, record := range response.Result {
@@ -171,32 +201,6 @@ func (c CloudflareClient) listRecords(ctx context.Context, recordName string) ([
 		}
 	}
 	return records, nil
-}
-
-func (c CloudflareClient) createRecord(ctx context.Context, record dnsRecord) error {
-	var response cloudflareEnvelope[dnsRecord]
-	if err := c.request(ctx, http.MethodPost, "/zones/"+url.PathEscape(c.ZoneID)+"/dns_records", record.payload(), &response); err != nil {
-		return fmt.Errorf("create Cloudflare %s record for %s: %w", record.Type, record.Content, err)
-	}
-	return nil
-}
-
-func (c CloudflareClient) updateRecord(ctx context.Context, record dnsRecord) error {
-	var response cloudflareEnvelope[dnsRecord]
-	path := "/zones/" + url.PathEscape(c.ZoneID) + "/dns_records/" + url.PathEscape(record.ID)
-	if err := c.request(ctx, http.MethodPut, path, record.payload(), &response); err != nil {
-		return fmt.Errorf("set Cloudflare record %s to DNS-only: %w", record.ID, err)
-	}
-	return nil
-}
-
-func (c CloudflareClient) deleteRecord(ctx context.Context, id string) error {
-	var response cloudflareEnvelope[json.RawMessage]
-	path := "/zones/" + url.PathEscape(c.ZoneID) + "/dns_records/" + url.PathEscape(id)
-	if err := c.request(ctx, http.MethodDelete, path, nil, &response); err != nil {
-		return fmt.Errorf("delete stale Cloudflare record %s: %w", id, err)
-	}
-	return nil
 }
 
 func (c CloudflareClient) request(ctx context.Context, method, path string, body any, result any) error {
@@ -224,11 +228,17 @@ func (c CloudflareClient) request(ctx context.Context, method, path string, body
 	}
 	response, err := client.Do(request)
 	if err != nil {
+		if ctx.Err() == nil {
+			return retryableCloudflareError{err: err}
+		}
 		return err
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
 	if err != nil {
+		if ctx.Err() == nil {
+			return retryableCloudflareError{err: err}
+		}
 		return err
 	}
 	var envelope struct {
@@ -239,6 +249,17 @@ func (c CloudflareClient) request(ctx context.Context, method, path string, body
 		} `json:"errors"`
 	}
 	if err := json.Unmarshal(responseBody, &envelope); err != nil {
+		if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500 {
+			return retryableCloudflareError{
+				err:        fmt.Errorf("Cloudflare API HTTP %s returned invalid JSON", response.Status),
+				retryAfter: parseRetryAfter(response.Header.Get("Retry-After"), time.Now()),
+			}
+		}
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			return retryableCloudflareError{
+				err: fmt.Errorf("Cloudflare API HTTP %s returned invalid JSON", response.Status),
+			}
+		}
 		return fmt.Errorf("Cloudflare API returned HTTP %s with invalid JSON", response.Status)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.Success {
@@ -246,9 +267,69 @@ func (c CloudflareClient) request(ctx context.Context, method, path string, body
 		for _, apiError := range envelope.Errors {
 			messages = append(messages, fmt.Sprintf("%d: %s", apiError.Code, apiError.Message))
 		}
-		return fmt.Errorf("Cloudflare API HTTP %s: %s", response.Status, strings.Join(messages, "; "))
+		apiErr := fmt.Errorf("Cloudflare API HTTP %s: %s", response.Status, strings.Join(messages, "; "))
+		if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500 {
+			return retryableCloudflareError{
+				err: apiErr, retryAfter: parseRetryAfter(response.Header.Get("Retry-After"), time.Now()),
+			}
+		}
+		return apiErr
 	}
 	return json.Unmarshal(responseBody, result)
+}
+
+func (c CloudflareClient) requestWithRetry(ctx context.Context, method, path string, body any, result any) error {
+	for attempt := 1; attempt <= cloudflareMaxAttempts; attempt++ {
+		err := c.request(ctx, method, path, body, result)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableCloudflareError(err) || attempt == cloudflareMaxAttempts {
+			return err
+		}
+		if err := waitCloudflareRetry(ctx, err, attempt); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("Cloudflare API retry attempts exhausted")
+}
+
+func isRetryableCloudflareError(err error) bool {
+	var retryable retryableCloudflareError
+	return errors.As(err, &retryable)
+}
+
+func waitCloudflareRetry(ctx context.Context, err error, attempt int) error {
+	delay := cloudflareRetryDelay * time.Duration(1<<(attempt-1))
+	var retryable retryableCloudflareError
+	if errors.As(err, &retryable) && retryable.retryAfter > delay {
+		delay = retryable.retryAfter
+	}
+	if delay > cloudflareMaxRetry {
+		delay = cloudflareMaxRetry
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(value); err == nil {
+		delay := retryAt.Sub(now)
+		if delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }
 
 func equalDNSName(first, second string) bool {
@@ -261,10 +342,4 @@ func (record dnsRecord) payload() dnsRecordPayload {
 		TTL: record.TTL, Proxied: record.Proxied, Comment: record.Comment,
 		Tags: record.Tags, Settings: record.Settings,
 	}
-}
-
-func sameIPContent(first, second string) bool {
-	firstIP, firstErr := netip.ParseAddr(first)
-	secondIP, secondErr := netip.ParseAddr(second)
-	return firstErr == nil && secondErr == nil && firstIP.Unmap() == secondIP.Unmap()
 }

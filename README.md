@@ -3,7 +3,7 @@
 A Go application for Linux VPSs. It collects Proxy IPs from different sources, deduplicates, scans them and updates a specified Cloudflare domain's A/AAAA records.  
 A manually uploaded file, URLs and domains are supported as sources.
 
-## Install on a Linux VPS
+## Install or Update
 
 The installer detects the CPU architecture, installs dependencies if missing, downloads and verifies the matching binary, installs `bpb-ip` service and starts an initial scan.  
 Running the installer again gets the scanner updated while preserving configs.
@@ -16,7 +16,6 @@ On first install, it interactively asks for the Cloudflare zone ID, dedicated DN
 Create a Cloudflare API token with **DNS: Edit** permission scoped to that zone.
 
 - The service updates only A/AAAA records at the configured hostname, sets them DNS-only, and leaves other record types untouched.
-- It adds new records before deleting stale ones.
 - A failed or empty source is logged while other inputs are used.
 - If no proxy IPs are collected from sources, scanning is skipped.
 - If none pass, the run fails without modifying DNS records.

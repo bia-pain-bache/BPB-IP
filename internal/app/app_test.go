@@ -274,7 +274,7 @@ func TestCheckEndpointsStopsRetriesAndPreservesInputOrder(t *testing.T) {
 	}
 }
 
-func TestReconcileDNSAddsBeforeRemovingAndKeepsOtherRecordTypes(t *testing.T) {
+func TestReconcileDNSBatchesChangesAndPreservesOtherRecordTypes(t *testing.T) {
 	var mu sync.Mutex
 	var calls []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -295,56 +295,58 @@ func TestReconcileDNSAddsBeforeRemovingAndKeepsOtherRecordTypes(t *testing.T) {
 				{"id":"keep","type":"A","name":"proxy.example.com","content":"192.0.2.1","ttl":1,"proxied":true},
 				{"id":"old-a","type":"A","name":"proxy.example.com","content":"192.0.2.2","ttl":1,"proxied":false},
 				{"id":"old-aaaa","type":"AAAA","name":"proxy.example.com","content":"2001:db8::2","ttl":1,"proxied":false},
+				{"id":"extra-a","type":"A","name":"proxy.example.com","content":"192.0.2.4","ttl":1,"proxied":false},
 				{"id":"cname","type":"CNAME","name":"proxy.example.com","content":"elsewhere.example.com","ttl":1,"proxied":false}
 			]}`)
-		case r.Method == http.MethodPost:
-			raw, err := io.ReadAll(r.Body)
-			if err != nil {
+		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone-id/dns_records/batch":
+			var body struct {
+				Deletes []dnsRecordDelete `json:"deletes"`
+				Posts   []json.RawMessage `json:"posts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Error(err)
 			}
-			var body dnsRecordPayload
-			if err := json.Unmarshal(raw, &body); err != nil {
-				t.Error(err)
+			wantDeleteIDs := []string{"extra-a", "keep", "old-a", "old-aaaa"}
+			if len(body.Deletes) != len(wantDeleteIDs) {
+				t.Errorf("batch deletes = %#v", body.Deletes)
+			} else {
+				for i, id := range wantDeleteIDs {
+					if body.Deletes[i].ID != id {
+						t.Errorf("batch delete %d = %#v, want ID %q", i, body.Deletes[i], id)
+					}
+				}
 			}
-			var fields map[string]json.RawMessage
-			if err := json.Unmarshal(raw, &fields); err != nil {
-				t.Error(err)
+			if len(body.Posts) != 4 {
+				t.Fatalf("batch posts = %#v, want all four desired records", body.Posts)
 			}
-			if _, hasID := fields["id"]; hasID {
-				t.Error("create payload must not include a read-only record ID")
+			posts := map[string]dnsRecordPayload{}
+			for _, rawPost := range body.Posts {
+				var post dnsRecordPayload
+				if err := json.Unmarshal(rawPost, &post); err != nil {
+					t.Error(err)
+				}
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(rawPost, &fields); err != nil {
+					t.Error(err)
+				}
+				if _, hasID := fields["id"]; hasID {
+					t.Error("new record payload must not include a read-only ID")
+				}
+				if post.Proxied || post.TTL != 1 || post.Name != "proxy.example.com" {
+					t.Errorf("new record is not DNS-only with automatic TTL: %#v", post)
+				}
+				posts[post.Type+":"+post.Content] = post
 			}
-			if body.Proxied || body.TTL != 1 || body.Name != "proxy.example.com" {
-				t.Errorf("new record not DNS-only with auto TTL: %#v", body)
+			for _, desired := range []string{
+				"A:192.0.2.1", "A:192.0.2.3",
+				"AAAA:2001:db8::1", "AAAA:2001:db8::3",
+			} {
+				if _, ok := posts[desired]; !ok {
+					t.Errorf("batch missing desired record %q: %#v", desired, posts)
+				}
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"success":true,"result":{"id":"created"}}`)
-		case r.Method == http.MethodPut && r.URL.Path == "/zones/zone-id/dns_records/keep":
-			raw, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Error(err)
-			}
-			var body dnsRecordPayload
-			if err := json.Unmarshal(raw, &body); err != nil {
-				t.Error(err)
-			}
-			var fields map[string]json.RawMessage
-			if err := json.Unmarshal(raw, &fields); err != nil {
-				t.Error(err)
-			}
-			if _, hasID := fields["id"]; hasID {
-				t.Error("update payload must not include a read-only record ID")
-			}
-			if body.Proxied {
-				t.Error("updated record should be DNS-only")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"success":true,"result":{"id":"keep"}}`)
-		case r.Method == http.MethodDelete:
-			if strings.HasSuffix(r.URL.Path, "/cname") {
-				t.Error("should not delete non-A/AAAA records")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"success":true,"result":{"id":"deleted"}}`)
+			_, _ = io.WriteString(w, `{"success":true,"result":{"deletes":[],"patches":[],"posts":[]}}`)
 		default:
 			http.Error(w, "unexpected request", http.StatusNotFound)
 		}
@@ -355,6 +357,7 @@ func TestReconcileDNSAddsBeforeRemovingAndKeepsOtherRecordTypes(t *testing.T) {
 		{IP: netip.MustParseAddr("192.0.2.1"), Port: 443},
 		{IP: netip.MustParseAddr("192.0.2.3"), Port: 443},
 		{IP: netip.MustParseAddr("2001:db8::1"), Port: 443},
+		{IP: netip.MustParseAddr("2001:db8::3"), Port: 443},
 		{IP: netip.MustParseAddr("192.0.2.4"), Port: 8443},
 	}
 	client := CloudflareClient{
@@ -369,21 +372,76 @@ func TestReconcileDNSAddsBeforeRemovingAndKeepsOtherRecordTypes(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	firstDelete := len(calls)
-	lastCreate := -1
-	for index, call := range calls {
-		if strings.HasPrefix(call, "POST ") && index > lastCreate {
-			lastCreate = index
-		}
-		if strings.HasPrefix(call, "DELETE ") && index < firstDelete {
-			firstDelete = index
-		}
+	if len(calls) != 2 || calls[1] != "POST /zones/zone-id/dns_records/batch" {
+		t.Fatalf("expected one list and one batch request, got %v", calls)
 	}
-	if lastCreate < 0 || firstDelete == len(calls) || lastCreate > firstDelete {
-		t.Fatalf("expected all creations before deletions, calls: %v", calls)
+}
+
+func TestReconcileDNSRetriesTransientCloudflareFailures(t *testing.T) {
+	var mu sync.Mutex
+	listCalls := 0
+	batchCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/zones/zone-id/dns_records":
+			mu.Lock()
+			listCalls++
+			call := listCalls
+			mu.Unlock()
+			if call == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, `{"success":false,"errors":[{"code":1000,"message":"temporarily unavailable"}]}`)
+				return
+			}
+			recordID := "old"
+			if call >= 3 {
+				recordID = "latest"
+			}
+			_, _ = fmt.Fprintf(w, `{"success":true,"result_info":{"total_pages":1},"result":[{"id":%q,"type":"A","name":"proxy.example.com","content":"192.0.2.9","ttl":1,"proxied":false}]}`, recordID)
+		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone-id/dns_records/batch":
+			var body struct {
+				Deletes []dnsRecordDelete `json:"deletes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			mu.Lock()
+			batchCalls++
+			call := batchCalls
+			mu.Unlock()
+			if call == 1 {
+				if len(body.Deletes) != 1 || body.Deletes[0].ID != "old" {
+					t.Errorf("first batch deletes = %#v", body.Deletes)
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, `{"success":false,"errors":[{"code":1000,"message":"temporarily unavailable"}]}`)
+				return
+			}
+			if len(body.Deletes) != 1 || body.Deletes[0].ID != "latest" {
+				t.Errorf("retried batch reused stale record IDs: %#v", body.Deletes)
+			}
+			_, _ = io.WriteString(w, `{"success":true,"result":{"deletes":[],"posts":[]}}`)
+		default:
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := CloudflareClient{
+		ZoneID:  "zone-id",
+		Token:   "test-token",
+		BaseURL: server.URL,
+		Client:  server.Client(),
 	}
-	if len(calls) != 6 {
-		t.Fatalf("got %d API calls, want 6: %v", len(calls), calls)
+	endpoints := []Endpoint{{IP: netip.MustParseAddr("192.0.2.1"), Port: 443}}
+	if err := client.ReconcileDNS(context.Background(), "proxy.example.com", endpoints); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if listCalls != 3 || batchCalls != 2 {
+		t.Fatalf("Cloudflare calls: %d list and %d batch; want 3 and 2", listCalls, batchCalls)
 	}
 }
 
