@@ -22,6 +22,7 @@ type Config struct {
 		ZoneID     string `json:"zoneId"`
 		RecordName string `json:"recordName"`
 		APIToken   string `json:"apiToken"`
+		MaxRecords int    `json:"maxRecords"`
 	} `json:"cloudflare"`
 }
 
@@ -52,6 +53,9 @@ func (c *Config) Validate() error {
 	}
 	if c.ConcurrentRuns < 1 || c.Trials < 1 {
 		return fmt.Errorf(`config "concurrentRuns" and "trials" must be positive integers`)
+	}
+	if c.Cloudflare.MaxRecords < 0 {
+		return fmt.Errorf(`config "cloudflare.maxRecords" must be zero or a positive integer`)
 	}
 	probeURL, err := url.ParseRequestURI(c.ProbeURL)
 	if err != nil || probeURL.Scheme != "https" || probeURL.Hostname() == "" {

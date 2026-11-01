@@ -22,8 +22,11 @@ const (
 	cloudflareMaxAttempts        = 3
 	cloudflareRetryDelay         = 250 * time.Millisecond
 	cloudflareMaxRetry           = 5 * time.Second
+	cloudflareRequestTimeout     = 2 * time.Minute
 	cloudflareMaxBatchOperations = 200
 )
+
+var defaultCloudflareHTTPClient = &http.Client{Timeout: cloudflareRequestTimeout}
 
 type CloudflareClient struct {
 	ZoneID  string
@@ -87,6 +90,10 @@ type cloudflareEnvelope[T any] struct {
 	ResultInfo struct {
 		TotalPages int `json:"total_pages"`
 	} `json:"result_info"`
+}
+
+type cloudflareZoneUsage struct {
+	RecordQuota *int `json:"record_quota"`
 }
 
 type retryableCloudflareError struct {
@@ -349,7 +356,26 @@ func normalizedDNSContent(content string) string {
 	return ip.Unmap().String()
 }
 
-func (c CloudflareClient) CountRecordsExcludingHostname(ctx context.Context, hostname string) (int, error) {
+func (c CloudflareClient) GetRecordQuota(ctx context.Context) (int, error) {
+	if strings.TrimSpace(c.ZoneID) == "" {
+		return 0, fmt.Errorf("Cloudflare zoneId is required")
+	}
+	if strings.TrimSpace(c.Token) == "" {
+		return 0, fmt.Errorf("Cloudflare API token is empty")
+	}
+
+	var response cloudflareEnvelope[cloudflareZoneUsage]
+	path := "/zones/" + url.PathEscape(c.ZoneID) + "/dns_records/usage"
+	if err := c.requestWithRetry(ctx, http.MethodGet, path, nil, &response); err != nil {
+		return 0, fmt.Errorf("get Cloudflare DNS record quota: %w", err)
+	}
+	if response.Result.RecordQuota == nil {
+		return 0, fmt.Errorf("Cloudflare DNS record quota is unavailable because record_quota is null")
+	}
+	return *response.Result.RecordQuota, nil
+}
+
+func (c CloudflareClient) CountUnmanagedRecords(ctx context.Context, hostname string) (int, error) {
 	if strings.TrimSpace(c.ZoneID) == "" {
 		return 0, fmt.Errorf("Cloudflare zoneId is required")
 	}
@@ -370,10 +396,12 @@ func (c CloudflareClient) CountRecordsExcludingHostname(ctx context.Context, hos
 		var response cloudflareEnvelope[[]dnsRecord]
 		path := "/zones/" + url.PathEscape(c.ZoneID) + "/dns_records?" + query.Encode()
 		if err := c.requestWithRetry(ctx, http.MethodGet, path, nil, &response); err != nil {
-			return 0, fmt.Errorf("count Cloudflare DNS records: %w", err)
+			return 0, fmt.Errorf("count unmanaged Cloudflare DNS records: %w", err)
 		}
 		for _, record := range response.Result {
-			if !equalDNSName(record.Name, hostname) {
+			managedRecord := equalDNSName(record.Name, hostname) &&
+				(record.Type == "A" || record.Type == "AAAA")
+			if !managedRecord {
 				recordCount++
 			}
 		}
@@ -439,7 +467,7 @@ func (c CloudflareClient) request(ctx context.Context, method, path string, body
 	request.Header.Set("Content-Type", "application/json")
 	client := c.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultCloudflareHTTPClient
 	}
 	response, err := client.Do(request)
 	if err != nil {

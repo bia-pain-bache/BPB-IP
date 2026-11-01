@@ -11,6 +11,7 @@
   "cloudflare": {
     "zoneId": "",
     "recordName": "",
-    "apiToken": ""
+    "apiToken": "",
+    "maxRecords": 0
   }
 }

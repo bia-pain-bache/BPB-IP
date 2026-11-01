@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,8 +19,6 @@ import (
 type Logger interface {
 	Printf(format string, values ...any)
 }
-
-const maxCloudflareRecords = 200
 
 type Options struct {
 	Context    context.Context
@@ -89,8 +86,7 @@ func Run(options Options) error {
 
 	recordName := strings.TrimSpace(config.Cloudflare.RecordName)
 	if options.DryRun {
-		uploadEndpoints := limitCloudflareEndpoints(working, maxCloudflareRecords)
-		options.Logger.Printf("dry run: would update DNS-only A/AAAA records for %s with up to %d fastest endpoints", recordName, len(uploadEndpoints))
+		options.Logger.Printf("dry run: would update DNS-only A/AAAA records for %s with %d fastest healthy endpoints; record quota not checked", recordName, len(working))
 		path, err := writeScanResults(options.ResultsDir, results, nil, time.Now())
 		if err != nil {
 			return err
@@ -108,21 +104,37 @@ func Run(options Options) error {
 	client := CloudflareClient{
 		ZoneID: config.Cloudflare.ZoneID,
 		Token:  token,
-		Client: &http.Client{Timeout: 30 * time.Second},
 	}
-	otherRecordCount, err := client.CountRecordsExcludingHostname(options.Context, recordName)
+	recordQuota, err := client.GetRecordQuota(options.Context)
 	if err != nil {
 		if _, writeErr := writeScanResults(options.ResultsDir, results, nil, time.Now()); writeErr != nil {
 			return fmt.Errorf("%w (also failed to write scan report: %v)", err, writeErr)
 		}
 		return err
 	}
-	availableSlots := availableCloudflareRecordSlots(otherRecordCount)
-	uploadEndpoints := limitCloudflareEndpoints(working, availableSlots)
+	otherRecordCount, err := client.CountUnmanagedRecords(options.Context, recordName)
+	if err != nil {
+		if _, writeErr := writeScanResults(options.ResultsDir, results, nil, time.Now()); writeErr != nil {
+			return fmt.Errorf("%w (also failed to write scan report: %v)", err, writeErr)
+		}
+		return err
+	}
+	availableSlots := availableCloudflareRecordSlots(recordQuota, otherRecordCount)
+	configuredMaxRecords := config.Cloudflare.MaxRecords
+	if configuredMaxRecords > availableSlots {
+		options.Logger.Printf(
+			"configured cloudflare.maxRecords is %d, but only %d Cloudflare DNS record slots are available; limiting maxRecords to %d",
+			configuredMaxRecords,
+			availableSlots,
+			availableSlots,
+		)
+	}
+	uploadSlots := cloudflareRecordLimit(configuredMaxRecords, availableSlots)
+	uploadEndpoints := limitCloudflareEndpoints(working, uploadSlots)
 	options.Logger.Printf(
-		"Cloudflare zone has %d records outside %s; using %d of %d available record slots for the fastest IPs",
+		"Cloudflare zone quota is %d records with %d unmanaged records; using %d of %d available record slots for the fastest IPs",
+		recordQuota,
 		otherRecordCount,
-		recordName,
 		len(uploadEndpoints),
 		availableSlots,
 	)
@@ -160,12 +172,19 @@ func Run(options Options) error {
 	return nil
 }
 
-func availableCloudflareRecordSlots(otherRecordCount int) int {
-	available := maxCloudflareRecords - otherRecordCount
+func availableCloudflareRecordSlots(recordQuota, otherRecordCount int) int {
+	available := recordQuota - otherRecordCount
 	if available < 0 {
 		return 0
 	}
 	return available
+}
+
+func cloudflareRecordLimit(configuredMaxRecords, availableSlots int) int {
+	if configuredMaxRecords > 0 && configuredMaxRecords < availableSlots {
+		return configuredMaxRecords
+	}
+	return availableSlots
 }
 
 func limitCloudflareEndpoints(endpoints []Endpoint, limit int) []Endpoint {
