@@ -137,6 +137,9 @@ fi
 if [[ ! -f "${INSTALL_DIR}/list.txt" ]]; then
   install -o root -g root -m 0644 /dev/null "${INSTALL_DIR}/list.txt"
 fi
+if [[ ! -f "${INSTALL_DIR}/archive.txt" ]]; then
+  install -o root -g root -m 0644 /dev/null "${INSTALL_DIR}/archive.txt"
+fi
 
 chown root:root "${INSTALL_DIR}/config.json"
 chmod 0600 "${INSTALL_DIR}/config.json"

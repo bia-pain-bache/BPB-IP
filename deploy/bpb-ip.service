@@ -16,7 +16,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/bpb-ip/results /var/log/bpb-ip.log
+ReadWritePaths=/opt/bpb-ip/archive.txt /opt/bpb-ip/results /var/log/bpb-ip.log
 
 [Install]
 WantedBy=multi-user.target
