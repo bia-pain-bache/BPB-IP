@@ -81,6 +81,17 @@ func CollectEndpoints(
 	logger Logger,
 	resolvers ...domainResolver,
 ) []Endpoint {
+	return CollectEndpointsWithArchive(ctx, localContents, "", config, logger, resolvers...)
+}
+
+func CollectEndpointsWithArchive(
+	ctx context.Context,
+	localContents string,
+	archiveContents string,
+	config Config,
+	logger Logger,
+	resolvers ...domainResolver,
+) []Endpoint {
 	resolveDomain := domainResolver(net.DefaultResolver.LookupIPAddr)
 	if len(resolvers) > 0 && resolvers[0] != nil {
 		resolveDomain = resolvers[0]
@@ -91,7 +102,7 @@ func CollectEndpoints(
 			return http.ErrUseLastResponse
 		},
 	}
-	return collectEndpoints(ctx, localContents, config, logger, resolveDomain, client)
+	return collectEndpointsWithArchive(ctx, localContents, archiveContents, config, logger, resolveDomain, client)
 }
 
 func collectEndpoints(
@@ -102,11 +113,30 @@ func collectEndpoints(
 	resolveDomain domainResolver,
 	client *http.Client,
 ) []Endpoint {
+	return collectEndpointsWithArchive(ctx, localContents, "", config, logger, resolveDomain, client)
+}
+
+func collectEndpointsWithArchive(
+	ctx context.Context,
+	localContents string,
+	archiveContents string,
+	config Config,
+	logger Logger,
+	resolveDomain domainResolver,
+	client *http.Client,
+) []Endpoint {
 	var inputs [][]Endpoint
 	local, err := ParseEndpoints(localContents)
 	logSource(logger, "list.txt", local, err)
 	if err == nil {
 		inputs = append(inputs, local)
+	}
+	if config.IncludeArchive {
+		archived, err := ParseEndpoints(archiveContents)
+		logSource(logger, "archive.txt", archived, err)
+		if err == nil {
+			inputs = append(inputs, archived)
+		}
 	}
 
 	for index, source := range config.SourceURLs {

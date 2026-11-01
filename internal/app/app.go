@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -55,12 +56,27 @@ func Run(options Options) error {
 		options.Logger.Printf("list.txt: failed to read %s: %v", options.ListPath, err)
 		localContents = nil
 	}
-	if err := validateSources(config, string(localContents), options.ListPath); err != nil {
+	archivePath := archiveFilePath(options.ListPath)
+	var archiveContents []byte
+	if config.IncludeArchive {
+		archiveContents, err = os.ReadFile(archivePath)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("read archive file %s: %w", archivePath, err)
+		}
+	}
+	if err := validateSources(config, string(localContents), string(archiveContents), archivePath, options.ListPath); err != nil {
 		return err
 	}
-	endpoints := CollectEndpoints(options.Context, string(localContents), config, options.Logger, nil)
+	endpoints := CollectEndpointsWithArchive(
+		options.Context,
+		string(localContents),
+		string(archiveContents),
+		config,
+		options.Logger,
+		nil,
+	)
 	if len(endpoints) == 0 {
-		path, err := writeScanResults(options.ResultsDir, nil, nil, time.Now())
+		path, err := writeScanResults(options.ResultsDir, nil, nil, probeStatusDeleted, time.Now())
 		if err != nil {
 			return err
 		}
@@ -76,7 +92,7 @@ func Run(options Options) error {
 		}
 	}
 	if len(working) == 0 {
-		path, err := writeScanResults(options.ResultsDir, results, nil, time.Now())
+		path, err := writeScanResults(options.ResultsDir, results, nil, probeStatusDeleted, time.Now())
 		if err != nil {
 			return err
 		}
@@ -87,7 +103,7 @@ func Run(options Options) error {
 	recordName := strings.TrimSpace(config.Cloudflare.RecordName)
 	if options.DryRun {
 		options.Logger.Printf("dry run: would update DNS-only A/AAAA records for %s with %d fastest healthy endpoints; record quota not checked", recordName, len(working))
-		path, err := writeScanResults(options.ResultsDir, results, nil, time.Now())
+		path, err := writeScanResults(options.ResultsDir, results, nil, probeStatusDeleted, time.Now())
 		if err != nil {
 			return err
 		}
@@ -96,7 +112,7 @@ func Run(options Options) error {
 	}
 	token := strings.TrimSpace(config.Cloudflare.APIToken)
 	if token == "" {
-		if _, err := writeScanResults(options.ResultsDir, results, nil, time.Now()); err != nil {
+		if _, err := writeScanResults(options.ResultsDir, results, nil, probeStatusDeleted, time.Now()); err != nil {
 			return err
 		}
 		return fmt.Errorf(`Cloudflare API token is empty in config "cloudflare.apiToken"`)
@@ -107,14 +123,14 @@ func Run(options Options) error {
 	}
 	recordQuota, err := client.GetRecordQuota(options.Context)
 	if err != nil {
-		if _, writeErr := writeScanResults(options.ResultsDir, results, nil, time.Now()); writeErr != nil {
+		if _, writeErr := writeScanResults(options.ResultsDir, results, nil, probeStatusDeleted, time.Now()); writeErr != nil {
 			return fmt.Errorf("%w (also failed to write scan report: %v)", err, writeErr)
 		}
 		return err
 	}
 	otherRecordCount, err := client.CountUnmanagedRecords(options.Context, recordName)
 	if err != nil {
-		if _, writeErr := writeScanResults(options.ResultsDir, results, nil, time.Now()); writeErr != nil {
+		if _, writeErr := writeScanResults(options.ResultsDir, results, nil, probeStatusDeleted, time.Now()); writeErr != nil {
 			return fmt.Errorf("%w (also failed to write scan report: %v)", err, writeErr)
 		}
 		return err
@@ -140,7 +156,16 @@ func Run(options Options) error {
 	)
 	if len(uploadEndpoints) == 0 {
 		deleted, reconcileErr := client.ReconcileDNSWithDeleted(options.Context, recordName, nil)
-		path, writeErr := writeScanResults(options.ResultsDir, results, deleted, time.Now())
+		archiveErr := archiveDeletedIPs(config.EnableArchive, archivePath, deleted)
+		deletedStatus := deletedIPStatus(config.EnableArchive, archiveErr)
+		if archiveErr != nil {
+			if reconcileErr != nil {
+				reconcileErr = fmt.Errorf("%w (also failed to archive deleted IPs: %v)", reconcileErr, archiveErr)
+			} else {
+				reconcileErr = archiveErr
+			}
+		}
+		path, writeErr := writeScanResults(options.ResultsDir, results, deleted, deletedStatus, time.Now())
 		if writeErr != nil {
 			if reconcileErr != nil {
 				return fmt.Errorf("%w (also failed to write scan report: %v)", reconcileErr, writeErr)
@@ -157,7 +182,16 @@ func Run(options Options) error {
 		return fmt.Errorf("Cloudflare DNS record limit reached: no record slots available outside %s", recordName)
 	}
 	deleted, reconcileErr := client.ReconcileDNSWithDeleted(options.Context, recordName, uploadEndpoints)
-	path, writeErr := writeScanResults(options.ResultsDir, results, deleted, time.Now())
+	archiveErr := archiveDeletedIPs(config.EnableArchive, archivePath, deleted)
+	deletedStatus := deletedIPStatus(config.EnableArchive, archiveErr)
+	if archiveErr != nil {
+		if reconcileErr != nil {
+			reconcileErr = fmt.Errorf("%w (also failed to archive deleted IPs: %v)", reconcileErr, archiveErr)
+		} else {
+			reconcileErr = archiveErr
+		}
+	}
+	path, writeErr := writeScanResults(options.ResultsDir, results, deleted, deletedStatus, time.Now())
 	if writeErr != nil {
 		if reconcileErr != nil {
 			return fmt.Errorf("%w (also failed to write scan report: %v)", reconcileErr, writeErr)
@@ -209,23 +243,116 @@ func ValidateSources(config Config, listPath string) error {
 			return fmt.Errorf("read source list %s: %w", listPath, err)
 		}
 	}
-	return validateSources(config, string(localContents), listPath)
+	archivePath := archiveFilePath(listPath)
+	var archiveContents []byte
+	if config.IncludeArchive {
+		archiveContents, err = os.ReadFile(archivePath)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("read archive file %s: %w", archivePath, err)
+		}
+	}
+	return validateSources(config, string(localContents), string(archiveContents), archivePath, listPath)
 }
 
-func validateSources(config Config, localContents, listPath string) error {
+func validateSources(config Config, localContents, archiveContents, archivePath, listPath string) error {
 	if hasRemoteSources(config) {
 		return nil
 	}
-	endpoints, err := ParseEndpoints(localContents)
-	if err != nil {
-		return fmt.Errorf("no usable sources configured; invalid endpoint data in %s: %w", listPath, err)
+	sources := []struct {
+		path     string
+		contents string
+	}{{path: listPath, contents: localContents}}
+	if config.IncludeArchive {
+		sources = append(sources, struct {
+			path     string
+			contents string
+		}{path: archivePath, contents: archiveContents})
 	}
-	for _, endpoint := range endpoints {
-		if endpoint.Port == 443 {
-			return nil
+	var invalidSourcePath string
+	var invalidSourceErr error
+	for _, source := range sources {
+		endpoints, err := ParseEndpoints(source.contents)
+		if err != nil {
+			if invalidSourceErr == nil {
+				invalidSourcePath = source.path
+				invalidSourceErr = err
+			}
+			continue
+		}
+		for _, endpoint := range endpoints {
+			if endpoint.Port == 443 {
+				return nil
+			}
 		}
 	}
+	if invalidSourceErr != nil {
+		return fmt.Errorf(
+			"no usable sources configured; invalid endpoint data in %s: %w",
+			invalidSourcePath,
+			invalidSourceErr,
+		)
+	}
 	return fmt.Errorf("no sources configured: add a source URL or domain to config, or a port 443 endpoint to %s", listPath)
+}
+
+func archiveFilePath(listPath string) string {
+	return filepath.Join(filepath.Dir(listPath), "archive.txt")
+}
+
+func archiveDeletedIPs(enabled bool, path string, deleted []Endpoint) error {
+	if !enabled || len(deleted) == 0 {
+		return nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read archive file %s: %w", path, err)
+	}
+	archived, err := ParseEndpoints(string(data))
+	if err != nil {
+		return fmt.Errorf("parse archive file %s: %w", path, err)
+	}
+
+	seen := make(map[netip.Addr]struct{}, len(archived)+len(deleted))
+	addresses := make([]string, 0, len(archived)+len(deleted))
+	appendAddress := func(ip netip.Addr) {
+		if !ip.IsValid() {
+			return
+		}
+		ip = ip.Unmap()
+		if _, exists := seen[ip]; exists {
+			return
+		}
+		seen[ip] = struct{}{}
+		addresses = append(addresses, ip.String())
+	}
+	for _, endpoint := range archived {
+		if endpoint.Port == 443 {
+			appendAddress(endpoint.IP)
+		}
+	}
+	for _, endpoint := range deleted {
+		appendAddress(endpoint.IP)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create archive directory %s: %w", filepath.Dir(path), err)
+	}
+	contents := strings.Join(addresses, "\n")
+	if len(contents) > 0 {
+		contents += "\n"
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		return fmt.Errorf("write archive file %s: %w", path, err)
+	}
+	return nil
+}
+
+func deletedIPStatus(archiveEnabled bool, archiveErr error) string {
+	if archiveEnabled && archiveErr == nil {
+		return probeStatusArchived
+	}
+	return probeStatusDeleted
 }
 
 func hasRemoteSources(config Config) bool {
@@ -280,7 +407,13 @@ func ConfigureCloudflare(path string, input io.Reader) error {
 	return nil
 }
 
-func writeScanResults(resultsDir string, results []endpointProbeResult, deleted []Endpoint, scannedAt time.Time) (string, error) {
+func writeScanResults(
+	resultsDir string,
+	results []endpointProbeResult,
+	deleted []Endpoint,
+	deletedStatus string,
+	scannedAt time.Time,
+) (string, error) {
 	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
 		return "", fmt.Errorf("create results directory %s: %w", resultsDir, err)
 	}
@@ -322,7 +455,7 @@ func writeScanResults(resultsDir string, results []endpointProbeResult, deleted 
 		if !endpoint.IP.IsValid() {
 			continue
 		}
-		if err := writer.Write([]string{endpoint.IP.Unmap().String(), probeStatusDeleted, "", ""}); err != nil {
+		if err := writer.Write([]string{endpoint.IP.Unmap().String(), deletedStatus, "", ""}); err != nil {
 			_ = file.Close()
 			return "", fmt.Errorf("write deleted endpoint to scan report: %w", err)
 		}

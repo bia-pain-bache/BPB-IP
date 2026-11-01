@@ -25,8 +25,9 @@ sudo systemctl enable --now bpb-ip.service
 - The service updates only A/AAAA records at the configured hostname, sets them DNS-only, and leaves other record types untouched.
 - A failed or empty source is logged while other inputs are used.
 - If no proxy IPs are collected from sources, scanning is skipped.
+- Deleted DNS IPs are added to `archive.txt` beside `list.txt` when `enableArchive` is `true` (the default). Existing entries are retained and deduplicated. Set `includeArchive` to `true` to health-check archived IPs as additional scan inputs; it defaults to `false`.
 - Before updating DNS, the service reads the zone's DNS record quota, counts records not managed as A/AAAA records at the configured hostname, and uses the remaining slots for the fastest healthy IPs, up to `cloudflare.maxRecords` when it is positive. Set `maxRecords` to `0` (the default) for no additional cap.
-- It patches existing A/AAAA records, deletes records beyond the selected set, and posts only the remaining IPs. The CSV lists old DNS IPs no longer present as `deleted`.
+- It patches existing A/AAAA records, deletes records beyond the selected set, and posts only the remaining IPs. The CSV lists old DNS IPs no longer present as `archived` when archiving succeeds, or `deleted` when archiving is disabled or fails.
 - If none pass, the run fails without modifying DNS records.
 - Each scan writes a `results-YYYY-MM-DD--HH-mm-ss.csv` file to `/opt/bpb-ip/results/`, with `IP`, `Status`, `Speed (KB/s)`, and `Error` columns. Speed is shown for passed IPs only; passed IPs are sorted fastest-first, failed IPs follow in scan order, and old DNS IPs no longer present are listed last as `deleted`.
 - The installer supports Linux `386`, `amd64`, `ARMv5/6/7`, `arm64`, `loong64`, `MIPS/MIPSLE`, `MIPS64/MIPS64LE`, `ppc64`, `ppc64le`, `riscv64` and `s390x`.

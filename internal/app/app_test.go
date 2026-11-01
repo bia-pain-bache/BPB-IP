@@ -121,6 +121,12 @@ func TestLoadConfigDefaultsMissingScanInterval(t *testing.T) {
 	if config.ScanInterval != "30m" {
 		t.Fatalf("missing scanInterval default = %q, want 30m", config.ScanInterval)
 	}
+	if !config.EnableArchive {
+		t.Fatal("missing enableArchive default = false, want true")
+	}
+	if config.IncludeArchive {
+		t.Fatal("missing includeArchive default = true, want false")
+	}
 }
 
 func TestScanIntervalValidation(t *testing.T) {
@@ -182,6 +188,57 @@ func TestValidateSourcesAcceptsListWithPort443Endpoint(t *testing.T) {
 	}
 }
 
+func TestValidateSourcesAcceptsArchiveWhenIncluded(t *testing.T) {
+	listPath := filepath.Join(t.TempDir(), "list.txt")
+	archivePath := archiveFilePath(listPath)
+	if err := os.WriteFile(archivePath, []byte("192.0.2.9\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := testConfig()
+	config.IncludeArchive = true
+	if err := ValidateSources(config, listPath); err != nil {
+		t.Fatalf("ValidateSources() with included archive = %v", err)
+	}
+	config.IncludeArchive = false
+	if err := ValidateSources(config, listPath); err == nil {
+		t.Fatal("ValidateSources() accepted archive when includeArchive is false")
+	}
+}
+
+func TestArchiveDeletedIPsRetainsAndDeduplicatesEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "archive.txt")
+	if err := os.WriteFile(path, []byte("192.0.2.1\n2001:db8::1\n192.0.2.1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deleted := []Endpoint{
+		{IP: netip.MustParseAddr("192.0.2.2"), Port: 443},
+		{IP: netip.MustParseAddr("192.0.2.1"), Port: 443},
+		{IP: netip.MustParseAddr("2001:db8::2"), Port: 443},
+	}
+	if err := archiveDeletedIPs(true, path, deleted); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "192.0.2.1\n2001:db8::1\n192.0.2.2\n2001:db8::2\n"
+	if string(contents) != want {
+		t.Fatalf("archive contents = %q, want %q", contents, want)
+	}
+}
+
+func TestArchiveDeletedIPsCanBeDisabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "archive.txt")
+	deleted := []Endpoint{{IP: netip.MustParseAddr("192.0.2.2"), Port: 443}}
+	if err := archiveDeletedIPs(false, path, deleted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("archive file stat error = %v, want file not to exist", err)
+	}
+}
+
 func TestConfigureCloudflareWritesCredentialsToConfig(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	sourceConfig, err := os.ReadFile(filepath.Join("..", "..", "config.json"))
@@ -227,6 +284,7 @@ func TestCollectEndpointsAggregatesBestEffortSourcesAndFilters443(t *testing.T) 
 		default:
 			http.NotFound(w, r)
 		}
+
 	}))
 	defer server.Close()
 
@@ -289,6 +347,29 @@ func TestCollectEndpointsAggregatesBestEffortSourcesAndFilters443(t *testing.T) 
 	}
 	if !logger.contains("sourceDomains: empty domain entry") {
 		t.Error("expected blank domain to be logged")
+	}
+}
+
+func TestCollectEndpointsIncludesArchiveWhenEnabled(t *testing.T) {
+	config := testConfig()
+	config.IncludeArchive = true
+	logger := &testLogger{}
+	endpoints := CollectEndpointsWithArchive(
+		context.Background(),
+		"192.0.2.1\n",
+		"192.0.2.2\n192.0.2.1\n192.0.2.3:8443\n",
+		config,
+		logger,
+	)
+	want := []Endpoint{
+		{IP: netip.MustParseAddr("192.0.2.1"), Port: 443},
+		{IP: netip.MustParseAddr("192.0.2.2"), Port: 443},
+	}
+	if !reflect.DeepEqual(endpoints, want) {
+		t.Fatalf("CollectEndpointsWithArchive() = %#v, want %#v", endpoints, want)
+	}
+	if logger.contains("archive.txt: no port 443 endpoints found") {
+		t.Fatalf("archive source was not recognized: %#v", logger.logs)
 	}
 }
 
@@ -1106,7 +1187,7 @@ func TestWriteScanResults(t *testing.T) {
 		{IP: netip.MustParseAddr("192.0.2.2"), Port: 443},
 	}
 	scannedAt := time.Date(2026, 11, 1, 0, 13, 56, 0, time.UTC)
-	path, err := writeScanResults(resultsDir, results, deleted, scannedAt)
+	path, err := writeScanResults(resultsDir, results, deleted, probeStatusDeleted, scannedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1128,6 +1209,31 @@ func TestWriteScanResults(t *testing.T) {
 		{"192.0.2.1", "passed", "12939.43", ""},
 		{"2001:db8::1", "failed", "", "probe timed out"},
 		{"192.0.2.2", "deleted", "", ""},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("scan report rows = %#v, want %#v", got, want)
+	}
+}
+
+func TestWriteScanResultsUsesArchivedStatus(t *testing.T) {
+	resultsDir := t.TempDir()
+	deleted := []Endpoint{{IP: netip.MustParseAddr("192.0.2.2"), Port: 443}}
+	path, err := writeScanResults(resultsDir, nil, deleted, probeStatusArchived, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	got, err := csv.NewReader(file).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"IP", "Status", "Speed (KB/s)", "Error"},
+		{"192.0.2.2", "archived", "", ""},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("scan report rows = %#v, want %#v", got, want)

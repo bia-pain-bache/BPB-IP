@@ -8,6 +8,8 @@
   "trials": 3,
   "sourceUrls": [],
   "sourceDomains": [],
+  "enableArchive": true,
+  "includeArchive": false,
   "cloudflare": {
     "zoneId": "",
     "recordName": "",

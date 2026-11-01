@@ -18,6 +18,8 @@ type Config struct {
 	Trials         int      `json:"trials"`
 	SourceURLs     []string `json:"sourceUrls"`
 	SourceDomains  []string `json:"sourceDomains"`
+	EnableArchive  bool     `json:"enableArchive"`
+	IncludeArchive bool     `json:"includeArchive"`
 	Cloudflare     struct {
 		ZoneID     string `json:"zoneId"`
 		RecordName string `json:"recordName"`
@@ -27,7 +29,7 @@ type Config struct {
 }
 
 func LoadConfig(path string) (Config, error) {
-	config := Config{ScanInterval: "30m"}
+	config := Config{ScanInterval: "30m", EnableArchive: true}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return config, fmt.Errorf("read config %s: %w", path, err)

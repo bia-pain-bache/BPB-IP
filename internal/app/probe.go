@@ -22,9 +22,10 @@ type endpointProbeResult struct {
 }
 
 const (
-	probeStatusPassed  = "passed"
-	probeStatusFailed  = "failed"
-	probeStatusDeleted = "deleted"
+	probeStatusPassed   = "passed"
+	probeStatusFailed   = "failed"
+	probeStatusDeleted  = "deleted"
+	probeStatusArchived = "archived"
 )
 
 func ProbeEndpoint(ctx context.Context, endpoint Endpoint, config Config) error {
